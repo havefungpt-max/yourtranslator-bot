@@ -1,258 +1,120 @@
+// index.js
+
 require('dotenv').config();
-const express = require('express');
-const { middleware, Client } = require('@line/bot-sdk');
-const { OpenAI } = require('openai');
-const { createClient } = require('@supabase/supabase-js');
-
-const app = express();
-
-/**
- * ========= 環境変数チェック =========
- */
-const requiredEnv = {
-  LINE_CHANNEL_ACCESS_TOKEN: !!process.env.LINE_CHANNEL_ACCESS_TOKEN,
-  LINE_CHANNEL_SECRET: !!process.env.LINE_CHANNEL_SECRET,
-  OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
-  SUPABASE_URL: !!process.env.SUPABASE_URL,
-  SUPABASE_SERVICE_ROLE_KEY: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
-};
-
-if (!Object.values(requiredEnv).every(Boolean)) {
-  console.error('❌ 必須の環境変数が足りません', requiredEnv);
-  process.exit(1);
-}
-
-/**
- * ========= クライアント初期化 =========
- */
-const lineConfig = {
-  channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
-  channelSecret: process.env.LINE_CHANNEL_SECRET,
-};
-const lineClient = new Client(lineConfig);
-
+const OpenAI = require('openai');
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+const SYSTEM_PROMPT = `
+You are the brain of a LINE bot called "YourTranslator" for Japanese users learning English.
 
-/**
- * ========= ユーザー関連ヘルパー =========
- * Supabase 側には yourtranslator 用の
- *   public.users (id, user_id, level_label, created_at, updated_at)
- * がある前提。
- */
+Goal
+- Given the latest user message and the saved user state, decide what the bot should do next.
+- Always respond ONLY with a single JSON object. No extra text.
 
-async function getOrCreateUser(userId) {
-  const { data, error } = await supabase
-    .from('users')
-    .select('*')
-    .eq('user_id', userId)
-    .maybeSingle();
+User input (from the app)
+- message: the latest message from the user (Japanese or English).
+- user_state: an object with:
+  - english_level: free text like "EIKEN Grade 2", "TOEIC 600", "junior high school level".
+  - english_flavor: "american", "british", or "jp-english".
+  - last_english_output: the last English sentence the bot produced for this user, or "" if none.
 
-  if (error && error.code !== 'PGRST116') {
-    console.error('❌ getOrCreateUser: select エラー', error);
-    throw error;
-  }
+Possible intents
+- "register_profile": user is telling or changing their English level or preferred English flavor.
+- "translate_or_rewrite": user sends Japanese or English content and wants a new English sentence.
+- "modify_tone": user wants to change the tone (polite / business / casual etc.) of last_english_output.
+- "show_help": user is asking how to use the bot.
+- "other": anything else.
 
-  if (data) return data;
+Tone handling
+- Map user requests like:
+  - "カジュアルに", "もっとカジュアルに" -> tone: "casual"
+  - "丁寧に", "もっと丁寧に", "ビジネスっぽく" -> tone: "polite_business"
+- For "modify_tone", never rewrite the Japanese command itself. Always apply the new tone to last_english_output.
+- If tone is unclear, use null.
 
-  const { data: inserted, error: insertError } = await supabase
-    .from('users')
-    .insert({ user_id: userId })
-    .select('*')
-    .single();
+Registration handling
+- Accept typos and noisy Japanese when detecting english_level and english_flavor.
+- Normalize english_flavor to one of: "american", "british", "jp-english".
+- If the user says things like "レベル変更", treat it as intent "register_profile" so the app can show a UI to change level.
 
-  if (insertError) {
-    console.error('❌ getOrCreateUser: insert エラー', insertError);
-    throw insertError;
-  }
+Output JSON schema
+Return exactly:
 
-  return inserted;
+{
+  "intent": "register_profile" | "translate_or_rewrite" | "modify_tone" | "show_help" | "other",
+  "detected_english_level": string | null,
+  "detected_english_flavor": "american" | "british" | "jp-english" | null,
+  "tone": "casual" | "polite_business" | null,
+  "should_reply_help": boolean,
+  "analysis_comment": string
 }
 
-async function updateUserLevel(userId, levelLabel) {
-  const { data, error } = await supabase
-    .from('users')
-    .update({ level_label: levelLabel })
-    .eq('user_id', userId)
-    .select('*')
-    .single();
-
-  if (error) {
-    console.error('❌ updateUserLevel エラー', error);
-    throw error;
-  }
-
-  return data;
-}
+Rules
+- analysis_comment is a short English explanation for developers (not shown to the end user).
+- should_reply_help is true only when the bot should send a help message next.
+- Never include any Japanese in the JSON values.
+- Do not output anything except this single JSON object.
+`;
 
 /**
- * ========= OpenAI で翻訳・リライト =========
- * - 日本語 -> レベルに合わせた英訳
- * - 英語 -> レベルに合わせた書き直し
+ * 判定用：ユーザメッセージ + ユーザ状態を投げて、意図JSONを返す
  */
-
-async function translateWithLevel(levelLabel, userText) {
-  const systemPrompt = `
-You are an English writing assistant for Japanese learners.
-User's self-reported level: "${levelLabel}".
-
-Rules:
-- If the user message is in Japanese, OUTPUT ONLY natural English at that level.
-- If the user message is already in English, rewrite it to match that level: clear, natural, and not too difficult.
-- Do NOT add explanations or Japanese. Only output the final English sentence(s).
-  `.trim();
+async function analyzeUserMessage(userText, userState) {
+  const userPayload = {
+    message: userText,
+    user_state: userState,
+  };
 
   const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: 'gpt-4o-mini', // or whatever you use
+    response_format: { type: 'json_object' },
     messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userText },
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content: JSON.stringify(userPayload) },
     ],
   });
 
-  return completion.choices[0]?.message?.content?.trim() || '';
-}
-
-/**
- * ========= メインのイベント処理 =========
- */
-
-async function handleTextMessage(event) {
-  const userId = event.source.userId;
-  const text = event.message.text.trim();
-
-  // 友だち以外（不明）の場合ガード
-  if (!userId) {
-    return lineClient.replyMessage(event.replyToken, {
-      type: 'text',
-      text: 'ユーザーIDを取得できませんでした。',
-    });
-  }
-
-  // 制御コマンド（ヘルプ・リセットなど）
-  if (text === 'ヘルプ' || text.toLowerCase() === 'help') {
-    return lineClient.replyMessage(event.replyToken, {
-      type: 'text',
-      text:
-        'YourTranslator です。\n\n' +
-        '① はじめに、あなたの英語レベルを日本語で教えてください。\n' +
-        '   例）英検2級 / TOEIC600 / 中学英語レベル など\n' +
-        '② 登録後は、日本語または英語の文章を送ると、\n' +
-        '   あなたのレベルに合わせた英語に翻訳・リライトします。\n\n' +
-        'レベルを変えたいときは「レベル変更」と送ってください。',
-    });
-  }
-
-  if (text === 'レベル変更') {
-    // level_label を NULL にして再登録モードへ
-    await updateUserLevel(userId, null);
-    return lineClient.replyMessage(event.replyToken, {
-      type: 'text',
-      text:
-        '英語レベルをリセットしました。\n' +
-        'あらためて、あなたの英語レベルを教えてください。\n' +
-        '例）英検準1級 / TOEIC800 / 日常会話レベル など',
-    });
-  }
-
-  // ユーザー取得 or 新規作成
-  const user = await getOrCreateUser(userId);
-
-  // まだレベル未設定 → 最初の1通目 or レベル変更直後
-  if (!user.level_label) {
-    const levelLabel = text; // そのまま保存する
-    await updateUserLevel(userId, levelLabel);
-
-    return lineClient.replyMessage(event.replyToken, {
-      type: 'text',
-      text:
-        `英語レベルを「${levelLabel}」として登録しました。\n\n` +
-        'これからは、日本語または英語の文章を送ると、\n' +
-        'あなたのレベルに合わせた英語に翻訳・リライトします。\n\n' +
-        '使い方の例：\n' +
-        '・「明日のミーティングをリスケしたいです。」\n' +
-        '・「カジュアルにお願いしたいニュアンスで」\n' +
-        '・英語の文を送って「もっと丁寧にして」など',
-    });
-  }
-
-  // ここからが通常利用：翻訳 / リライト
-  const levelLabel = user.level_label;
-
+  const raw = completion.choices[0].message.content;
+  let parsed;
   try {
-    const translated = await translateWithLevel(levelLabel, text);
-
-    if (!translated) {
-      return lineClient.replyMessage(event.replyToken, {
-        type: 'text',
-        text: '翻訳結果を取得できませんでした。少し時間をおいて再度お試しください。',
-      });
-    }
-
-    // シンプルな2段構成：レベル表示 + 結果
-    const replyText =
-      `【レベル: ${levelLabel} に合わせた英語】\n` +
-      '------------------------------\n' +
-      translated;
-
-    return lineClient.replyMessage(event.replyToken, {
-      type: 'text',
-      text: replyText,
-    });
-  } catch (err) {
-    console.error('❌ translateWithLevel エラー', err);
-    return lineClient.replyMessage(event.replyToken, {
-      type: 'text',
-      text: '翻訳中にエラーが発生しました。しばらくしてからもう一度お試しください。',
-    });
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    console.error('JSON parse error:', e, raw);
+    // フォールバック：最低限 other を返す
+    parsed = {
+      intent: 'other',
+      detected_english_level: null,
+      detected_english_flavor: null,
+      tone: null,
+      should_reply_help: false,
+      analysis_comment: 'Fallback because JSON parse failed.',
+    };
   }
+  return parsed;
 }
 
-/**
- * ========= LINE Webhook =========
- */
+// -------------- 以下は動作テスト用 --------------
 
-app.post('/webhook', middleware(lineConfig), async (req, res) => {
-  const events = req.body.events || [];
-  console.log('📩 Webhook received:', events.length, 'events');
+// ダミーユーザ状態（実際はDBから取る）
+const dummyState = {
+  english_level: 'EIKEN 2',
+  english_flavor: 'american',
+  last_english_output: 'I would like to reschedule tomorrow\'s meeting.',
+};
 
-  const tasks = events.map(async (event) => {
-    try {
-      if (event.type === 'message' && event.message.type === 'text') {
-        await handleTextMessage(event);
-      } else {
-        // それ以外は無視
-        console.log('ℹ️ 未対応イベント type=', event.type);
-      }
-    } catch (err) {
-      console.error('❌ イベント処理中エラー:', err);
-      // replyToken は一度しか使えないので、ここでの再返信は控える
-    }
-  });
+async function main() {
+  const userText = 'もっと丁寧に'; // LINE から来たテキストをここに入れる想定
 
-  await Promise.all(tasks);
-  res.sendStatus(200);
-});
+  const result = await analyzeUserMessage(userText, dummyState);
+  console.log('Result JSON:', result);
+}
 
-/**
- * ========= 動作確認用エンドポイント =========
- */
+if (require.main === module) {
+  main().catch(console.error);
+}
 
-app.get('/', (req, res) => {
-  res.send('✅ YourTranslator bot is LIVE');
-});
-
-/**
- * ========= サーバ起動 =========
- */
-
-const port = process.env.PORT || 8080;
-app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
-});
+module.exports = {
+  analyzeUserMessage,
+};

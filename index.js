@@ -1,5 +1,3 @@
-// index.js (Webhook 周りだけ抜粋)
-
 const express = require('express');
 const { middleware, Client } = require('@line/bot-sdk');
 require('dotenv').config();
@@ -13,54 +11,45 @@ const config = {
 
 const client = new Client(config);
 
-// JSON ボディ
-app.use(express.json());
-
-// Webhook 受信
+// ✅ /webhook だけに LINE の middleware を適用
 app.post('/webhook', middleware(config), (req, res) => {
-  // ① 先に 200 を返すキューを積んでおく
-  //   → イベントごとの処理は「非同期」で投げる
   const events = req.body.events || [];
 
-  // 非同期で処理（awaitしない）
+  // 非同期で処理を投げる
   Promise.all(
-    events.map((event) => handleEvent(event).catch(err => {
-      console.error('handleEvent error:', err);
-    }))
-  ).then(() => {
-    // ここは実際にはすでに 200 返しててもOK
-  });
+    events.map(event =>
+      handleEvent(event).catch(err => console.error('handleEvent error:', err))
+    )
+  );
 
-  // ② HTTP レスポンスは即返す
+  // HTTP レスポンスは即 200
   res.sendStatus(200);
 });
 
-// 実際のイベント処理
+// 他のルートで JSON 使いたいなら、別で
+app.use('/api', express.json());
+
+app.get('/', (req, res) => {
+  res.send('ok');
+});
+
 async function handleEvent(event) {
-  if (event.type !== 'message' || event.message.type !== 'text') {
-    return;
-  }
+  if (event.type !== 'message' || event.message.type !== 'text') return;
 
   const userText = event.message.text;
 
-  // ここで GPT 呼び出し & 翻訳 / 判定
-  const replyText = await translateOrWhatever(userText, event);
+  // ここで GPT 叩くなど
+  const replyText = `echo: ${userText}`;
 
-  // LINE に返信（ここは webhook のレスポンスとは別の話）
   await client.replyMessage(event.replyToken, {
     type: 'text',
     text: replyText,
   });
 }
 
-// 例:GPT呼び出し部分
-async function translateOrWhatever(userText, event) {
-  // OpenAI 呼び出し
-  // ここは今までどおり。ただし timeout は短めにしておく方が安全
-  return `echo: ${userText}`;
-}
-
-const port = process.env.PORT || 3000;
+const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log(`Server listening on ${port}`);
+  console.log('Token:', process.env.LINE_CHANNEL_ACCESS_TOKEN ? 'OK' : 'Missing');
+  console.log('Secret:', process.env.LINE_CHANNEL_SECRET ? 'OK' : 'Missing');
 });

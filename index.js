@@ -1,936 +1,945 @@
 // index.js
+// YourTranslator / LINE Bot
+// 必要な環境変数：
+// - LINE_CHANNEL_ACCESS_TOKEN
+// - LINE_CHANNEL_SECRET
+// - OPENAI_API_KEY
+// - OPENAI_MODEL (任意。指定なければ gpt-4o-mini)
+// - SUPABASE_URL
+// - SUPABASE_SERVICE_ROLE_KEY
 
 const express = require('express');
 const { middleware, Client } = require('@line/bot-sdk');
-const OpenAI = require('openai');
 const { createClient } = require('@supabase/supabase-js');
+const OpenAI = require('openai');
 require('dotenv').config();
 
-// -----------------------
-// 環境変数
-// -----------------------
-const config = {
+// ---------- 基本セットアップ ----------
+const app = express();
+
+const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
 };
 
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+const lineClient = new Client(lineConfig);
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-const client = new Client(config);
-const app = express();
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-// -----------------------
-// 簡易メモリ（最後の英文など）
-// key = lineUserId
-// value = { lastSourceText, lastCandidate, lastTone }
-// -----------------------
-const userContext = new Map();
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'; // 一番安い系
 
-// -----------------------
-// ユーザー設定のデフォルト
-// -----------------------
-const DEFAULT_SETTINGS = {
-  english_level_type: 'EIKEN',          // 'EIKEN' | 'TOEIC'
-  english_level_value: 'EIKEN_2',       // 例: EIKEN_2 / TOEIC_600_799
-  english_style_default: 'POLITE',      // 'CASUAL' | 'POLITE' | 'BUSINESS'
-  english_variant: 'JP',                // 'JP' | 'US' | 'UK'
-};
+app.use(express.json());
+app.post('/webhook', middleware(lineConfig), async (req, res) => {
+  const events = req.body.events;
+  if (!events || events.length === 0) {
+    return res.status(200).end();
+  }
 
-// -----------------------
-// Supabase: ユーザー取得・作成・更新
-// -----------------------
-async function getOrCreateUserSettings(lineUserId) {
-  // 既存確認
+  try {
+    await Promise.all(events.map(handleEvent));
+    res.status(200).end();
+  } catch (err) {
+    console.error('Error handling events:', err);
+    res.status(500).end();
+  }
+});
+
+// ---------- ユーザー情報（Supabase） ----------
+
+async function getOrCreateUser(lineUserId) {
   const { data, error } = await supabase
-    .from('user_settings')
+    .from('users')
     .select('*')
     .eq('line_user_id', lineUserId)
-    .maybeSingle();
+    .limit(1);
 
   if (error) {
-    console.error('Supabase get user error:', error);
-    // Supabase死んでる場合でも動くようにメモリだけで返す
-    return { line_user_id: lineUserId, ...DEFAULT_SETTINGS };
+    console.error('Supabase select error:', error);
+    throw error;
   }
 
-  if (data) {
-    return data;
+  if (data && data.length > 0) {
+    return data[0];
   }
 
-  // なければ作成
-  const insertData = {
+  // デフォルト値
+  const now = new Date().toISOString();
+  const newUser = {
     line_user_id: lineUserId,
-    ...DEFAULT_SETTINGS,
+    level_type: 'eiken',        // 'eiken' | 'toeic' | 'rough'
+    level_value: '2',           // 例: '5','4','3','pre2','2','pre1','1'
+    english_style: 'neutral',   // 'neutral' | 'american' | 'british'
+    usage_default: 'CHAT_FRIEND', // 'CHAT_FRIEND' | 'MAIL_INTERNAL' | 'MAIL_EXTERNAL'
+    tone_default: 'polite',       // 'casual' | 'polite' | 'business'
+    created_at: now,
+    updated_at: now,
   };
 
   const { data: inserted, error: insertError } = await supabase
-    .from('user_settings')
-    .insert(insertData)
+    .from('users')
+    .insert(newUser)
     .select('*')
     .single();
 
   if (insertError) {
-    console.error('Supabase insert user error:', insertError);
-    return { line_user_id: lineUserId, ...DEFAULT_SETTINGS };
+    console.error('Supabase insert error:', insertError);
+    throw insertError;
   }
 
   return inserted;
 }
 
-async function updateUserSettings(lineUserId, updates) {
-  const payload = {
-    ...updates,
-    updated_at: new Date().toISOString(),
-  };
-
+async function updateUser(lineUserId, patch) {
+  const now = new Date().toISOString();
   const { data, error } = await supabase
-    .from('user_settings')
-    .update(payload)
+    .from('users')
+    .update({ ...patch, updated_at: now })
     .eq('line_user_id', lineUserId)
     .select('*')
-    .maybeSingle();
+    .single();
 
   if (error) {
-    console.error('Supabase update user error:', error);
-    return null;
+    console.error('Supabase update error:', error);
+    throw error;
   }
-
   return data;
 }
 
-// -----------------------
-// Quick Reply builder
-// -----------------------
-function buildQuickReply(extraActions = []) {
-  const items = [
-    ...extraActions.map((action) => ({
-      type: 'action',
-      action,
-    })),
+// ---------- ヘルパー：言語判定 ----------
+
+function detectLanguage(text) {
+  const hasJa = /[一-龯ぁ-んァ-ン]/.test(text);
+  const hasEn = /[A-Za-z]/.test(text);
+
+  if (hasJa && hasEn) return 'mixed';
+  if (hasJa) return 'ja';
+  if (hasEn) return 'en';
+  return 'other';
+}
+
+// ---------- ヘルパー：Quick Reply ----------
+
+function baseQuickReplyItems() {
+  return [
     {
       type: 'action',
-      action: {
-        type: 'message',
-        label: '🏠 ホーム',
-        text: 'ホーム',
-      },
+      action: { type: 'message', label: 'ホーム', text: 'ホーム' },
+    },
+    {
+      type: 'action',
+      action: { type: 'message', label: '使い方', text: '使い方' },
     },
   ];
-
-  return { items };
 }
 
-// -----------------------
-// 設定値 → 表示テキスト
-// -----------------------
-function describeLevel(settings) {
-  if (settings.english_level_type === 'EIKEN') {
-    switch (settings.english_level_value) {
-      case 'EIKEN_5':
-        return '英検5級';
-      case 'EIKEN_4':
-        return '英検4級';
-      case 'EIKEN_3':
-        return '英検3級';
-      case 'EIKEN_2':
-        return '英検2級';
-      case 'EIKEN_1':
-        return '英検1級';
-      default:
-        return '英検2級相当';
-    }
-  } else if (settings.english_level_type === 'TOEIC') {
-    switch (settings.english_level_value) {
-      case 'TOEIC_0_399':
-        return 'TOEIC 〜399';
-      case 'TOEIC_400_599':
-        return 'TOEIC 400〜599';
-      case 'TOEIC_600_799':
-        return 'TOEIC 600〜799';
-      case 'TOEIC_800_895':
-        return 'TOEIC 800〜895';
-      case 'TOEIC_900_990':
-        return 'TOEIC 900〜990';
-      default:
-        return 'TOEIC 600〜799';
-    }
+function toneQuickReplyItems() {
+  return [
+    {
+      type: 'action',
+      action: { type: 'message', label: 'カジュアルに', text: 'トーン:カジュアル' },
+    },
+    {
+      type: 'action',
+      action: { type: 'message', label: '丁寧に', text: 'トーン:丁寧' },
+    },
+    {
+      type: 'action',
+      action: { type: 'message', label: 'ビジネスに', text: 'トーン:ビジネス' },
+    },
+    {
+      type: 'action',
+      action: { type: 'message', label: 'この英文でOK', text: 'この英文でOK' },
+    },
+    ...baseQuickReplyItems(),
+  ];
+}
+
+function homeQuickReplyItems() {
+  return [
+    {
+      type: 'action',
+      action: { type: 'message', label: 'レベル', text: '[設定] レベル' },
+    },
+    {
+      type: 'action',
+      action: { type: 'message', label: '用途', text: '[設定] 用途' },
+    },
+    {
+      type: 'action',
+      action: { type: 'message', label: '文体', text: '[設定] 文体' },
+    },
+    {
+      type: 'action',
+      action: { type: 'message', label: '英語タイプ', text: '[設定] 英語タイプ' },
+    },
+    {
+      type: 'action',
+      action: { type: 'message', label: '使い方', text: '使い方' },
+    },
+  ];
+}
+
+// ---------- OpenAI 呼び出し ----------
+
+async function generateEnglishFromJapanese({ user, sourceText, toneOverride }) {
+  const levelText =
+    user.level_type === 'eiken'
+      ? `EIKEN Grade ${user.level_value}`
+      : user.level_type === 'toeic'
+      ? `TOEIC score range ${user.level_value}`
+      : `rough level ${user.level_value}`;
+
+  const usageText = {
+    CHAT_FRIEND: 'chat with friends or colleagues',
+    MAIL_INTERNAL: 'internal business email',
+    MAIL_EXTERNAL: 'external business email with clients',
+  }[user.usage_default] || 'chat with friends or colleagues';
+
+  const tone = toneOverride || user.tone_default; // 'casual' | 'polite' | 'business'
+
+  const systemPrompt = `
+You are an English writing assistant for Japanese users.
+- When the user sends Japanese, translate or rewrite it into natural English.
+- Consider the user's level, usage scene, tone, and English style.
+- Output ONLY the English sentence(s). No Japanese. No explanations. No quotes.
+  `.trim();
+
+  const userPrompt = `
+User level: ${levelText}
+Usage scene: ${usageText}
+Tone: ${tone}
+English style: ${user.english_style} (neutral = globally understandable)
+Source language: Japanese
+
+Japanese text:
+${sourceText}
+  `.trim();
+
+  const completion = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0.3,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+  });
+
+  const content = completion.choices[0]?.message?.content?.trim() || '';
+  return content;
+}
+
+async function explainEnglishToJapaneseWithGlossary({ user, sourceText }) {
+  const levelText =
+    user.level_type === 'eiken'
+      ? `EIKEN Grade ${user.level_value}`
+      : user.level_type === 'toeic'
+      ? `TOEIC score range ${user.level_value}`
+      : `rough level ${user.level_value}`;
+
+  const systemPrompt = `
+You are an English-to-Japanese translator and tutor for Japanese learners.
+- First, translate the English text into natural Japanese.
+- Then, pick up 0–5 words or expressions that are probably difficult for the user.
+- The user level will be provided.
+- Return ONLY a JSON object with this shape:
+
+{
+  "ja": "自然な日本語訳",
+  "glossary": [
+    { "term": "英単語や表現", "meaning_ja": "日本語の意味", "note_ja": "やさしい日本語での補足" }
+  ]
+}
+
+No extra text. No comments. No Markdown. No backticks.
+  `.trim();
+
+  const userPrompt = `
+User level: ${levelText}
+
+English text:
+${sourceText}
+  `.trim();
+
+  const completion = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0.3,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+  });
+
+  let raw = completion.choices[0]?.message?.content || '';
+
+  // 念のため、```json などを剥がす
+  raw = raw.trim();
+  if (raw.startsWith('```')) {
+    raw = raw.replace(/^```[a-zA-Z]*\n?/, '').replace(/```$/, '').trim();
   }
-  return '英検2級相当';
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    console.error('JSON parse error from OpenAI:', e, raw);
+    // 最悪、全部テキストとして返す
+    return {
+      ja: raw,
+      glossary: [],
+    };
+  }
+
+  return {
+    ja: parsed.ja || '',
+    glossary: Array.isArray(parsed.glossary) ? parsed.glossary : [],
+  };
 }
 
-function describeTone(settings) {
-  switch (settings.english_style_default) {
-    case 'CASUAL':
+// ---------- メインイベントハンドラ ----------
+
+async function handleEvent(event) {
+  if (event.type !== 'message' || event.message.type !== 'text') {
+    return;
+  }
+
+  const userId = event.source.userId;
+  if (!userId) return;
+
+  const text = (event.message.text || '').trim();
+  const user = await getOrCreateUser(userId);
+
+  // 特殊コマンド（ミックス入力用）
+  if (text.startsWith('TRANSLATE_TO_EN:::')) {
+    const original = text.replace('TRANSLATE_TO_EN:::', '');
+    return handleJaToEn(original, event.replyToken, user, { force: 'en' });
+  }
+  if (text.startsWith('TRANSLATE_TO_JA:::')) {
+    const original = text.replace('TRANSLATE_TO_JA:::', '');
+    return handleEnToJa(original, event.replyToken, user, { force: 'ja' });
+  }
+
+  // 設定・ヘルプ系
+  if (text === 'ヘルプ') {
+    return replyHelp(event.replyToken);
+  }
+  if (text === 'ホーム') {
+    return replyHome(event.replyToken, user);
+  }
+  if (text === '使い方') {
+    return replyUsage(event.replyToken);
+  }
+
+  // 設定フロー
+  if (text === '[設定] レベル') {
+    return replyLevelRoot(event.replyToken);
+  }
+  if (text === '[設定] 英検レベル') {
+    return replyLevelEiken(event.replyToken);
+  }
+  if (text.startsWith('SET_LEVEL_EIKEN_')) {
+    return handleSetLevelEiken(event.replyToken, user, text);
+  }
+
+  if (text === '[設定] 用途') {
+    return replyUsageScene(event.replyToken);
+  }
+  if (text.startsWith('SET_USAGE_')) {
+    return handleSetUsageScene(event.replyToken, user, text);
+  }
+
+  if (text === '[設定] 文体') {
+    return replyToneSetting(event.replyToken);
+  }
+  if (text.startsWith('SET_TONE_')) {
+    return handleSetTone(event.replyToken, user, text);
+  }
+
+  if (text === '[設定] 英語タイプ') {
+    return replyEnglishStyle(event.replyToken);
+  }
+  if (text.startsWith('SET_EN_STYLE_')) {
+    return handleSetEnglishStyle(event.replyToken, user, text);
+  }
+
+  // トーン変更
+  if (text.startsWith('トーン:')) {
+    const toneLabel = text.replace('トーン:', '');
+    return handleToneChange(event.replyToken, user, toneLabel);
+  }
+
+  // 「この英文でOK」 → コピペ用＋ワンポイント
+  if (text.includes('この英文で')) {
+    return handleAcceptCurrentEnglish(event.replyToken, user);
+  }
+
+  // ここから本文処理
+  const lang = detectLanguage(text);
+
+  if (lang === 'ja') {
+    return handleJaToEn(text, event.replyToken, user);
+  } else if (lang === 'en') {
+    return handleEnToJa(text, event.replyToken, user);
+  } else if (lang === 'mixed') {
+    return handleMixed(text, event.replyToken);
+  } else {
+    // その他の言語は対象外
+    return lineClient.replyMessage(event.replyToken, {
+      type: 'text',
+      text: '今は日本語と英語だけをサポートしています。\n日本語か英語で送ってみてください。',
+      quickReply: { items: baseQuickReplyItems() },
+    });
+  }
+}
+
+// ---------- 各種返信ハンドラ ----------
+
+async function replyHelp(replyToken) {
+  const message = {
+    type: 'text',
+    text:
+      'YourTranslator です 👋\n\n' +
+      '・日本語で送る → 英文を作成\n' +
+      '・英語で送る → 和訳＋むずかしめ単語のミニ解説\n' +
+      '・日本語＋英語まじり → 英訳 / 和訳を選択\n\n' +
+      'まずは「ホーム」でレベルやよく使う場面をゆるく決めておくとラクです。\n' +
+      '困ったらまた「ヘルプ」と送ってください。',
+    quickReply: { items: baseQuickReplyItems() },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+function usageSceneLabel(usage_default) {
+  switch (usage_default) {
+    case 'CHAT_FRIEND':
+      return '友だち・同僚とのチャット';
+    case 'MAIL_INTERNAL':
+      return '社内メール';
+    case 'MAIL_EXTERNAL':
+      return '社外メール';
+    default:
+      return '友だち・同僚とのチャット';
+  }
+}
+
+function toneLabel(tone_default) {
+  switch (tone_default) {
+    case 'casual':
       return 'カジュアル';
-    case 'BUSINESS':
+    case 'business':
       return 'ビジネス';
-    case 'POLITE':
     default:
       return '丁寧';
   }
 }
 
-function describeVariant(settings) {
-  switch (settings.english_variant) {
-    case 'US':
-      return 'US英語';
-    case 'UK':
-      return 'UK英語';
-    case 'JP':
+function englishStyleLabel(style) {
+  switch (style) {
+    case 'american':
+      return 'アメリカ寄り';
+    case 'british':
+      return 'イギリス寄り';
     default:
       return '日本人向け（無難）';
   }
 }
 
-// -----------------------
-// GPT 用 System Prompt
-// -----------------------
-function buildSystemPrompt(settings, toneOverride) {
-  const levelText = describeLevel(settings);
-  const variantText = describeVariant(settings);
-
-  const style = toneOverride || settings.english_style_default;
-
-  let toneText = 'polite but natural English';
-  if (style === 'CASUAL') {
-    toneText = 'casual, friendly English';
-  } else if (style === 'BUSINESS') {
-    toneText = 'polite and formal business English';
+function levelLabel(user) {
+  if (user.level_type === 'eiken') {
+    return `英検${user.level_value}級`;
   }
-
-  let variantTextEn = 'You may mix US/UK spelling in a neutral way.';
-  if (settings.english_variant === 'US') {
-    variantTextEn = 'Use US English spelling and expressions.';
-  } else if (settings.english_variant === 'UK') {
-    variantTextEn = 'Use UK English spelling and expressions.';
-  } else if (settings.english_variant === 'JP') {
-    variantTextEn =
-      'Use safe, clear English that Japanese business people often use in emails or chats.';
+  if (user.level_type === 'toeic') {
+    return `TOEIC ${user.level_value}`;
   }
-
-  return `
-You are an English rewriting assistant for Japanese learners.
-
-- The user sends Japanese or English sentences for real communication (email, chat, etc.).
-- Rewrite or translate them into natural English.
-
-Target level:
-- Approximately "${levelText}" level.
-
-Tone:
-- Use ${toneText}.
-
-English variety:
-- ${variantTextEn}
-
-Rules:
-- Output ONLY one English sentence (or a short paragraph) as the answer.
-- Do NOT add Japanese explanations.
-- Do NOT add extra commentary.
-- Do NOT wrap the text in quotes.
-`.trim();
+  return `ざっくり ${user.level_value}`;
 }
 
-function buildOnePointPrompt(settings, baseSentence) {
-  const levelText = describeLevel(settings);
-  const variantText = describeVariant(settings);
-
-  return `
-You are an English coach for Japanese learners.
-
-Student profile:
-- Level: ${levelText}
-- English variety: ${variantText}
-
-Base sentence:
-${baseSentence}
-
-Task:
-- Suggest ONE slightly more advanced or natural alternative English sentence.
-- Then, in Japanese, explain in at most 2 short sentences why it is a good expression or in what situation to use it.
-
-Format:
-英語: <improved English sentence>
-解説: <short explanation in Japanese>
-`.trim();
-}
-
-// -----------------------
-// ホーム画面
-// -----------------------
-async function replyHomeMenu(replyToken, settings) {
+async function replyHome(replyToken, user) {
   const text =
-    `YourTranslator ホーム\n\n` +
-    `現在の設定:\n` +
-    `・レベル: ${describeLevel(settings)}\n` +
-    `・英語タイプ: ${describeVariant(settings)}\n` +
-    `・デフォルト文体: ${describeTone(settings)}\n\n` +
-    `変更したい項目を選んでください。`;
+    'YourTranslator ホーム\n\n' +
+    'いまの設定はこんな感じです：\n' +
+    `・レベル: ${levelLabel(user)}\n` +
+    `・よく使う場面: ${usageSceneLabel(user.usage_default)}\n` +
+    `・英語の雰囲気: ${englishStyleLabel(user.english_style)}\n` +
+    `・デフォルト文体: ${toneLabel(user.tone_default)}\n\n` +
+    '変えたい項目があれば、下のボタンからどうぞ。';
 
-  const quickReply = buildQuickReply([
-    {
-      type: 'message',
-      label: 'レベルを変更',
-      text: '[設定] レベル',
-    },
-    {
-      type: 'message',
-      label: '英語タイプ変更',
-      text: '[設定] 英語タイプ',
-    },
-    {
-      type: 'message',
-      label: '文体を変更',
-      text: '[設定] 文体',
-    },
-    {
-      type: 'message',
-      label: '使い方',
-      text: '使い方',
-    },
-  ]);
-
-  return client.replyMessage(replyToken, {
+  const message = {
     type: 'text',
     text,
-    quickReply,
-  });
+    quickReply: { items: homeQuickReplyItems() },
+  };
+  return lineClient.replyMessage(replyToken, message);
 }
 
-// -----------------------
-// 設定メニュー系
-// -----------------------
-async function replyLevelMenu(replyToken) {
-  const text = 'レベルの決め方を選んでください。';
-
-  const quickReply = buildQuickReply([
-    {
-      type: 'message',
-      label: '英検で選ぶ',
-      text: '[設定] 英検レベル',
-    },
-    {
-      type: 'message',
-      label: 'TOEICで選ぶ',
-      text: '[設定] TOEICスコア',
-    },
-  ]);
-
-  return client.replyMessage(replyToken, {
-    type: 'text',
-    text,
-    quickReply,
-  });
-}
-
-async function replyEikenMenu(replyToken) {
-  const text = '英検の級を選んでください。';
-
-  const quickReply = buildQuickReply([
-    {
-      type: 'message',
-      label: '英検5級',
-      text: 'SET_LEVEL_EIKEN_5',
-    },
-    {
-      type: 'message',
-      label: '英検4級',
-      text: 'SET_LEVEL_EIKEN_4',
-    },
-    {
-      type: 'message',
-      label: '英検3級',
-      text: 'SET_LEVEL_EIKEN_3',
-    },
-    {
-      type: 'message',
-      label: '英検2級',
-      text: 'SET_LEVEL_EIKEN_2',
-    },
-    {
-      type: 'message',
-      label: '英検1級',
-      text: 'SET_LEVEL_EIKEN_1',
-    },
-  ]);
-
-  return client.replyMessage(replyToken, {
-    type: 'text',
-    text,
-    quickReply,
-  });
-}
-
-async function replyToeicMenu(replyToken) {
-  const text = 'TOEICのスコア帯を選んでください。';
-
-  const quickReply = buildQuickReply([
-    {
-      type: 'message',
-      label: '〜399',
-      text: 'SET_LEVEL_TOEIC_0_399',
-    },
-    {
-      type: 'message',
-      label: '400〜599',
-      text: 'SET_LEVEL_TOEIC_400_599',
-    },
-    {
-      type: 'message',
-      label: '600〜799',
-      text: 'SET_LEVEL_TOEIC_600_799',
-    },
-    {
-      type: 'message',
-      label: '800〜895',
-      text: 'SET_LEVEL_TOEIC_800_895',
-    },
-    {
-      type: 'message',
-      label: '900〜990',
-      text: 'SET_LEVEL_TOEIC_900_990',
-    },
-  ]);
-
-  return client.replyMessage(replyToken, {
-    type: 'text',
-    text,
-    quickReply,
-  });
-}
-
-async function replyToneMenu(replyToken, settings) {
+async function replyUsage(replyToken) {
   const text =
-    'デフォルトの文体を選んでください。\n' +
-    '・カジュアル: 友達や同僚向け\n' +
-    '・丁寧: 一般的なビジネスメール\n' +
-    '・ビジネス: かっちりした文面';
+    'YourTranslator の使い方（ざっくり）\n\n' +
+    '1. 「ホーム」で自分のレベルと、よく使う場面（チャット / 社内メール / 社外メール）を決める\n' +
+    '2. あとは日本語 or 英語の文を送るだけ\n' +
+    '   ・日本語 → 英文を作成\n' +
+    '   ・英語 → 和訳＋むずかしめ単語のミニ解説\n' +
+    '3. 英文が出たら、クイックメニューで\n' +
+    '   ・カジュアル / 丁寧 / ビジネス に言い換え\n' +
+    '   ・「この英文でOK」で、本文だけ＋ワンポイントレッスン\n\n' +
+    '深く考えなくて大丈夫なので、送りたい文をそのまま投げてみてください。';
 
-  const quickReply = buildQuickReply([
-    {
-      type: 'message',
-      label: 'カジュアル',
-      text: 'SET_TONE_CASUAL',
-    },
-    {
-      type: 'message',
-      label: '丁寧',
-      text: 'SET_TONE_POLITE',
-    },
-    {
-      type: 'message',
-      label: 'ビジネス',
-      text: 'SET_TONE_BUSINESS',
-    },
-  ]);
-
-  return client.replyMessage(replyToken, {
+  const message = {
     type: 'text',
     text,
-    quickReply,
-  });
-}
-
-async function replyVariantMenu(replyToken, settings) {
-  const text =
-    '英語のタイプを選んでください。\n' +
-    '・日本人向け: 無難で分かりやすい表現\n' +
-    '・US英語: アメリカ英語\n' +
-    '・UK英語: イギリス英語';
-
-  const quickReply = buildQuickReply([
-    {
-      type: 'message',
-      label: '日本人向け',
-      text: 'SET_VARIANT_JP',
-    },
-    {
-      type: 'message',
-      label: 'US英語',
-      text: 'SET_VARIANT_US',
-    },
-    {
-      type: 'message',
-      label: 'UK英語',
-      text: 'SET_VARIANT_UK',
-    },
-  ]);
-
-  return client.replyMessage(replyToken, {
-    type: 'text',
-    text,
-    quickReply,
-  });
-}
-
-// -----------------------
-// 翻訳・リライト本体
-// -----------------------
-async function handleTranslate(lineUserId, replyToken, text) {
-  const settings = await getOrCreateUserSettings(lineUserId);
-
-  const systemPrompt = buildSystemPrompt(settings);
-
-  const completion = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: text },
-    ],
-  });
-
-  const english = (completion.choices[0].message.content || '').trim();
-
-  // コンテキスト保存（再トーン・この英文で良い 用）
-  userContext.set(lineUserId, {
-    lastSourceText: text,
-    lastCandidate: english,
-    lastTone: settings.english_style_default,
-  });
-
-  const header =
-    `【レベル: ${describeLevel(settings)} / 文体: ${describeTone(
-      settings
-    )} / 英語タイプ: ${describeVariant(settings)}】\n` +
-    `------------------------------\n`;
-
-  const quickReply = buildQuickReply([
-    {
-      type: 'message',
-      label: 'カジュアル',
-      text: 'カジュアル',
-    },
-    {
-      type: 'message',
-      label: '丁寧',
-      text: '丁寧',
-    },
-    {
-      type: 'message',
-      label: 'ビジネス',
-      text: 'ビジネス',
-    },
-    {
-      type: 'message',
-      label: 'この英文で良い',
-      text: 'この英文で良い',
-    },
-  ]);
-
-  return client.replyMessage(replyToken, {
-    type: 'text',
-    text: header + english,
-    quickReply,
-  });
-}
-
-async function handleRetone(lineUserId, replyToken, toneLabel) {
-  const ctx = userContext.get(lineUserId);
-  if (!ctx || !ctx.lastSourceText) {
-    const quickReply = buildQuickReply([]);
-    return client.replyMessage(replyToken, {
-      type: 'text',
-      text: '直近の文章が見つかりません。もう一度文章を送ってください。',
-      quickReply,
-    });
-  }
-
-  const settings = await getOrCreateUserSettings(lineUserId);
-
-  let toneOverride = settings.english_style_default;
-  if (toneLabel === 'カジュアル') toneOverride = 'CASUAL';
-  if (toneLabel === '丁寧') toneOverride = 'POLITE';
-  if (toneLabel === 'ビジネス') toneOverride = 'BUSINESS';
-
-  const systemPrompt = buildSystemPrompt(settings, toneOverride);
-
-  const completion = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: ctx.lastSourceText },
-    ],
-  });
-
-  const english = (completion.choices[0].message.content || '').trim();
-
-  // 更新
-  userContext.set(lineUserId, {
-    lastSourceText: ctx.lastSourceText,
-    lastCandidate: english,
-    lastTone: toneOverride,
-  });
-
-  // header用に一時的に style を書き換えたコピーを作る
-  const displaySettings = {
-    ...settings,
-    english_style_default: toneOverride,
+    quickReply: { items: baseQuickReplyItems() },
   };
 
-  const header =
-    `【レベル: ${describeLevel(displaySettings)} / 文体: ${describeTone(
-      displaySettings
-    )} / 英語タイプ: ${describeVariant(displaySettings)}】\n` +
-    `------------------------------\n`;
-
-  const quickReply = buildQuickReply([
-    {
-      type: 'message',
-      label: 'カジュアル',
-      text: 'カジュアル',
-    },
-    {
-      type: 'message',
-      label: '丁寧',
-      text: '丁寧',
-    },
-    {
-      type: 'message',
-      label: 'ビジネス',
-      text: 'ビジネス',
-    },
-    {
-      type: 'message',
-      label: 'この英文で良い',
-      text: 'この英文で良い',
-    },
-  ]);
-
-  return client.replyMessage(replyToken, {
-    type: 'text',
-    text: header + english,
-    quickReply,
-  });
+  return lineClient.replyMessage(replyToken, message);
 }
 
-async function handleAcceptSentence(lineUserId, replyToken) {
-  const ctx = userContext.get(lineUserId);
-  if (!ctx || !ctx.lastCandidate) {
-    const quickReply = buildQuickReply([]);
-    return client.replyMessage(replyToken, {
+// -- レベル設定 --
+
+async function replyLevelRoot(replyToken) {
+  const message = {
+    type: 'text',
+    text: 'レベルの決め方を選んでください。',
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: { type: 'message', label: '英検で設定', text: '[設定] 英検レベル' },
+        },
+        {
+          type: 'action',
+          action: {
+            type: 'message',
+            label: 'TOEIC（準備中）',
+            text: 'TOEIC設定は準備中です',
+          },
+        },
+        {
+          type: 'action',
+          action: {
+            type: 'message',
+            label: 'ざっくり（準備中）',
+            text: 'ざっくりレベル設定は準備中です',
+          },
+        },
+      ],
+    },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+async function replyLevelEiken(replyToken) {
+  const message = {
+    type: 'text',
+    text: '英検の級を選んでください。',
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: { type: 'message', label: '5級', text: 'SET_LEVEL_EIKEN_5' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '4級', text: 'SET_LEVEL_EIKEN_4' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '3級', text: 'SET_LEVEL_EIKEN_3' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '準2級', text: 'SET_LEVEL_EIKEN_PRE2' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '2級', text: 'SET_LEVEL_EIKEN_2' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '準1級', text: 'SET_LEVEL_EIKEN_PRE1' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '1級', text: 'SET_LEVEL_EIKEN_1' },
+        },
+      ],
+    },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+async function handleSetLevelEiken(replyToken, user, text) {
+  const code = text.replace('SET_LEVEL_EIKEN_', ''); // 5,4,3,PRE2,2,PRE1,1
+  let value = code.toLowerCase();
+
+  // DB には "5","4","3","pre2","2","pre1","1" のように入れる
+  const updated = await updateUser(user.line_user_id, {
+    level_type: 'eiken',
+    level_value: value,
+  });
+
+  const message = {
+    type: 'text',
+    text: `レベルを「英検${levelLabel(updated)}」のイメージで登録しました。\n日本語か英語で文を送ってみてください。`,
+    quickReply: { items: baseQuickReplyItems() },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+// -- 用途設定 --
+
+async function replyUsageScene(replyToken) {
+  const message = {
+    type: 'text',
+    text: 'よく使う場面を選んでください。',
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: {
+            type: 'message',
+            label: '友だち・同僚チャット',
+            text: 'SET_USAGE_CHAT_FRIEND',
+          },
+        },
+        {
+          type: 'action',
+          action: {
+            type: 'message',
+            label: '社内メール',
+            text: 'SET_USAGE_MAIL_INTERNAL',
+          },
+        },
+        {
+          type: 'action',
+          action: {
+            type: 'message',
+            label: '社外メール',
+            text: 'SET_USAGE_MAIL_EXTERNAL',
+          },
+        },
+      ],
+    },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+async function handleSetUsageScene(replyToken, user, text) {
+  let usage = 'CHAT_FRIEND';
+  if (text === 'SET_USAGE_MAIL_INTERNAL') usage = 'MAIL_INTERNAL';
+  if (text === 'SET_USAGE_MAIL_EXTERNAL') usage = 'MAIL_EXTERNAL';
+
+  const updated = await updateUser(user.line_user_id, {
+    usage_default: usage,
+  });
+
+  const message = {
+    type: 'text',
+    text: `よく使う場面を「${usageSceneLabel(updated.usage_default)}」として登録しました。`,
+    quickReply: { items: baseQuickReplyItems() },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+// -- 文体設定 --
+
+async function replyToneSetting(replyToken) {
+  const message = {
+    type: 'text',
+    text: 'ふだんの文体を選んでください。',
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: { type: 'message', label: 'カジュアル', text: 'SET_TONE_CASUAL' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: '丁寧', text: 'SET_TONE_POLITE' },
+        },
+        {
+          type: 'action',
+          action: { type: 'message', label: 'ビジネス', text: 'SET_TONE_BUSINESS' },
+        },
+      ],
+    },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+async function handleSetTone(replyToken, user, text) {
+  let tone = 'polite';
+  if (text === 'SET_TONE_CASUAL') tone = 'casual';
+  if (text === 'SET_TONE_BUSINESS') tone = 'business';
+
+  const updated = await updateUser(user.line_user_id, {
+    tone_default: tone,
+  });
+
+  const message = {
+    type: 'text',
+    text: `デフォルト文体を「${toneLabel(updated.tone_default)}」にしました。`,
+    quickReply: { items: baseQuickReplyItems() },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+// -- 英語タイプ設定 --
+
+async function replyEnglishStyle(replyToken) {
+  const message = {
+    type: 'text',
+    text: '英語の雰囲気を選んでください。\n迷ったら「日本人向け（無難）」でOKです。',
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: {
+            type: 'message',
+            label: '日本人向け（無難）',
+            text: 'SET_EN_STYLE_NEUTRAL',
+          },
+        },
+        {
+          type: 'action',
+          action: {
+            type: 'message',
+            label: 'アメリカ寄り',
+            text: 'SET_EN_STYLE_AMERICAN',
+          },
+        },
+        {
+          type: 'action',
+          action: {
+            type: 'message',
+            label: 'イギリス寄り',
+            text: 'SET_EN_STYLE_BRITISH',
+          },
+        },
+      ],
+    },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+async function handleSetEnglishStyle(replyToken, user, text) {
+  let style = 'neutral';
+  if (text === 'SET_EN_STYLE_AMERICAN') style = 'american';
+  if (text === 'SET_EN_STYLE_BRITISH') style = 'british';
+
+  const updated = await updateUser(user.line_user_id, {
+    english_style: style,
+  });
+
+  const message = {
+    type: 'text',
+    text: `英語の雰囲気を「${englishStyleLabel(updated.english_style)}」にしました。`,
+    quickReply: { items: baseQuickReplyItems() },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+// -- トーン変更 --
+
+async function handleToneChange(replyToken, user, toneLabelJa) {
+  if (!user.last_source_ja) {
+    return lineClient.replyMessage(replyToken, {
       type: 'text',
-      text: '直近の英文が見つかりません。もう一度文章を送ってください。',
-      quickReply,
+      text: 'まず日本語の文を送って英文を作ってから、文体を変えてみてください。',
+      quickReply: { items: baseQuickReplyItems() },
     });
   }
 
-  const settings = await getOrCreateUserSettings(lineUserId);
+  let toneOverride = user.tone_default;
+  if (toneLabelJa.includes('カジュアル')) toneOverride = 'casual';
+  if (toneLabelJa.includes('丁寧')) toneOverride = 'polite';
+  if (toneLabelJa.includes('ビジネス')) toneOverride = 'business';
 
-  // 1通目: コピペ用の英文のみ
+  const en = await generateEnglishFromJapanese({
+    user,
+    sourceText: user.last_source_ja,
+    toneOverride,
+  });
+
+  // last_output_en を更新
+  await updateUser(user.line_user_id, {
+    last_output_en: en,
+    last_mode: 'JA_TO_EN',
+  });
+
+  const message = {
+    type: 'text',
+    text: en,
+    quickReply: { items: toneQuickReplyItems() },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+// -- 「この英文でOK」 --
+
+async function handleAcceptCurrentEnglish(replyToken, user) {
+  const en = user.last_output_en;
+  if (!en) {
+    return lineClient.replyMessage(replyToken, {
+      type: 'text',
+      text: 'まず日本語の文を送って、英文を作ってから選んでください。',
+      quickReply: { items: baseQuickReplyItems() },
+    });
+  }
+
+  // コピペ用の英文だけ
   const copyMessage = {
     type: 'text',
-    text: ctx.lastCandidate,
-    quickReply: buildQuickReply([]),
+    text: en,
   };
 
-  // 2通目: ワンポイントレッスン
-  const onePointPrompt = buildOnePointPrompt(settings, ctx.lastCandidate);
-  const completion = await openai.chat.completions.create({
-    model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
-    messages: [
-      { role: 'system', content: onePointPrompt },
-      { role: 'user', content: 'ワンポイントレッスンを出してください。' },
-    ],
-  });
+  // ワンポイントレッスン
+  const systemPrompt = `
+You are an English coach for Japanese learners.
+The user has just decided to use the following English sentence.
+Give ONE short upgrade example and a brief explanation in Japanese.
 
-  const lessonText = (completion.choices[0].message.content || '').trim();
+Rules:
+- Output in Japanese, except for the example English sentence.
+- 3–5 lines.
+- Tone: friendly and supportive, not teacher-ish.
+  `.trim();
 
-  const lessonMessage = {
-    type: 'text',
-    text: `ワンポイントレッスン\n------------------------------\n${lessonText}`,
-    quickReply: buildQuickReply([]),
-  };
+  const userPrompt = `English sentence:\n${en}`;
 
-  return client.replyMessage(replyToken, [copyMessage, lessonMessage]);
+  let lessonText = '';
+  try {
+    const completion = await openai.chat.completions.create({
+      model: OPENAI_MODEL,
+      temperature: 0.4,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+    });
+    lessonText = completion.choices[0]?.message?.content?.trim() || '';
+  } catch (e) {
+    console.error('One-point lesson error:', e);
+  }
+
+  const lessonMessage = lessonText
+    ? {
+        type: 'text',
+        text: 'ワンポイントレッスン\n------------------------------\n' + lessonText,
+        quickReply: { items: baseQuickReplyItems() },
+      }
+    : {
+        type: 'text',
+        text: 'コピペ用の英文をお届けしました。',
+        quickReply: { items: baseQuickReplyItems() },
+      };
+
+  return lineClient.replyMessage(replyToken, [copyMessage, lessonMessage]);
 }
 
-// -----------------------
-// 使い方ヘルプ
-// -----------------------
-async function replyHelp(replyToken) {
-  const text =
-    'YourTranslator 使い方\n\n' +
-    '1. まず「ホーム」→「レベルを変更」「英語タイプ変更」「文体を変更」で初期設定してください。\n' +
-    '2. その後、日本語または英語の文章を送ると、設定に合わせて英語に翻訳・リライトします。\n' +
-    '3. 出てきた英文に対して、クイックメニューで「カジュアル」「丁寧」「ビジネス」を選ぶと、' +
-    '同じ内容を別の文体で作り直します。\n' +
-    '4. 「この英文で良い」を押すと、コピペ用の英文だけを返し、その後にワンポイントレッスンが届きます。';
+// -- 日本語 → 英語 --
 
-  const quickReply = buildQuickReply([
-    {
-      type: 'message',
-      label: 'ホーム',
-      text: 'ホーム',
+async function handleJaToEn(text, replyToken, user, options = {}) {
+  // 混在モードから強制英訳で呼ばれた、などの future 用
+  const en = await generateEnglishFromJapanese({
+    user,
+    sourceText: text,
+    toneOverride: null,
+  });
+
+  // DB に直近を保存
+  await updateUser(user.line_user_id, {
+    last_source_ja: text,
+    last_output_en: en,
+    last_mode: 'JA_TO_EN',
+  });
+
+  const message = {
+    type: 'text',
+    text: en, // 設定ヘッダは出さない
+    quickReply: { items: toneQuickReplyItems() },
+  };
+  return lineClient.replyMessage(replyToken, message);
+}
+
+// -- 英語 → 日本語（和訳＋語彙解説） --
+
+async function handleEnToJa(text, replyToken, user, options = {}) {
+  const { ja, glossary } = await explainEnglishToJapaneseWithGlossary({
+    user,
+    sourceText: text,
+  });
+
+  let resultText = ja;
+  if (glossary && glossary.length > 0) {
+    resultText += '\n\n◆チェックしておきたい単語・表現\n';
+    glossary.forEach((g) => {
+      if (!g.term) return;
+      resultText += `・${g.term}\n  意味: ${g.meaning_ja || ''}\n`;
+      if (g.note_ja) {
+        resultText += `  メモ: ${g.note_ja}\n`;
+      }
+    });
+  }
+
+  // 直近を保存（必要になったら使う）
+  await updateUser(user.line_user_id, {
+    last_source_en: text,
+    last_output_ja: ja,
+    last_mode: 'EN_TO_JA',
+  });
+
+  const message = {
+    type: 'text',
+    text: resultText,
+    quickReply: { items: baseQuickReplyItems() },
+  };
+
+  return lineClient.replyMessage(replyToken, message);
+}
+
+// -- 日本語＋英語混在 --
+
+async function handleMixed(text, replyToken) {
+  const message = {
+    type: 'text',
+    text:
+      '日本語と英語がいっしょに入っているみたいです。\n' +
+      'この文を「英訳」か「和訳」か、どちらで扱うか選んでください。',
+    quickReply: {
+      items: [
+        {
+          type: 'action',
+          action: {
+            type: 'message',
+            label: '英訳してほしい',
+            text: `TRANSLATE_TO_EN:::${text}`,
+          },
+        },
+        {
+          type: 'action',
+          action: {
+            type: 'message',
+            label: '和訳してほしい',
+            text: `TRANSLATE_TO_JA:::${text}`,
+          },
+        },
+        ...baseQuickReplyItems(),
+      ],
     },
-  ]);
+  };
 
-  return client.replyMessage(replyToken, {
-    type: 'text',
-    text,
-    quickReply,
-  });
+  return lineClient.replyMessage(replyToken, message);
 }
 
-// -----------------------
-// メインイベントハンドラ
-// -----------------------
-async function handleEvent(event) {
-  const lineUserId = event.source && event.source.userId;
-
-  if (!lineUserId) {
-    return;
-  }
-
-  if (event.type === 'follow') {
-    const settings = await getOrCreateUserSettings(lineUserId);
-    const text =
-      'YourTranslator です。\n\n' +
-      'まずは「ホーム」からレベルや文体を設定してみてください。\n' +
-      'その後、日本語または英語の文章を送ると、あなたの設定に合わせて英語にして返します。';
-
-    const quickReply = buildQuickReply([
-      {
-        type: 'message',
-        label: 'ホーム',
-        text: 'ホーム',
-      },
-    ]);
-
-    return client.replyMessage(event.replyToken, {
-      type: 'text',
-      text,
-      quickReply,
-    });
-  }
-
-  if (event.type === 'message' && event.message.type === 'text') {
-    const text = event.message.text.trim();
-
-    // --- ホーム・設定 ---
-    if (text === 'ホーム' || text === 'メニュー') {
-      const settings = await getOrCreateUserSettings(lineUserId);
-      return replyHomeMenu(event.replyToken, settings);
-    }
-
-    if (text === '設定') {
-      const settings = await getOrCreateUserSettings(lineUserId);
-      return replyHomeMenu(event.replyToken, settings);
-    }
-
-    if (text === '使い方') {
-      return replyHelp(event.replyToken);
-    }
-
-    // --- 設定メニュー ---
-    if (text === '[設定] レベル') {
-      return replyLevelMenu(event.replyToken);
-    }
-
-    if (text === '[設定] 英検レベル') {
-      return replyEikenMenu(event.replyToken);
-    }
-
-    if (text === '[設定] TOEICスコア') {
-      return replyToeicMenu(event.replyToken);
-    }
-
-    if (text === '[設定] 文体') {
-      const settings = await getOrCreateUserSettings(lineUserId);
-      return replyToneMenu(event.replyToken, settings);
-    }
-
-    if (text === '[設定] 英語タイプ') {
-      const settings = await getOrCreateUserSettings(lineUserId);
-      return replyVariantMenu(event.replyToken, settings);
-    }
-
-    // --- レベル設定（英検） ---
-    if (text.startsWith('SET_LEVEL_EIKEN_')) {
-      const grade = text.replace('SET_LEVEL_EIKEN_', '');
-      const settings = await updateUserSettings(lineUserId, {
-        english_level_type: 'EIKEN',
-        english_level_value: `EIKEN_${grade}`,
-      });
-
-      const msg =
-        `レベルを「${describeLevel(settings)}」として登録しました。\n\n` +
-        '日本語または英語の文章を送ると、そのレベルに合わせて英語に変換します。';
-
-      const quickReply = buildQuickReply([
-        {
-          type: 'message',
-          label: 'ホーム',
-          text: 'ホーム',
-        },
-      ]);
-
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: msg,
-        quickReply,
-      });
-    }
-
-    // --- レベル設定（TOEIC） ---
-    if (text.startsWith('SET_LEVEL_TOEIC_')) {
-      const range = text.replace('SET_LEVEL_TOEIC_', '');
-      const settings = await updateUserSettings(lineUserId, {
-        english_level_type: 'TOEIC',
-        english_level_value: `TOEIC_${range}`,
-      });
-
-      const msg =
-        `レベルを「${describeLevel(settings)}」として登録しました。\n\n` +
-        '日本語または英語の文章を送ると、そのレベルに合わせて英語に変換します。';
-
-      const quickReply = buildQuickReply([
-        {
-          type: 'message',
-          label: 'ホーム',
-          text: 'ホーム',
-        },
-      ]);
-
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: msg,
-        quickReply,
-      });
-    }
-
-    // --- 文体設定 ---
-    if (text === 'SET_TONE_CASUAL') {
-      const settings = await updateUserSettings(lineUserId, {
-        english_style_default: 'CASUAL',
-      });
-      const msg = `デフォルトの文体を「${describeTone(settings)}」に変更しました。`;
-
-      const quickReply = buildQuickReply([]);
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: msg,
-        quickReply,
-      });
-    }
-
-    if (text === 'SET_TONE_POLITE') {
-      const settings = await updateUserSettings(lineUserId, {
-        english_style_default: 'POLITE',
-      });
-      const msg = `デフォルトの文体を「${describeTone(settings)}」に変更しました。`;
-
-      const quickReply = buildQuickReply([]);
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: msg,
-        quickReply,
-      });
-    }
-
-    if (text === 'SET_TONE_BUSINESS') {
-      const settings = await updateUserSettings(lineUserId, {
-        english_style_default: 'BUSINESS',
-      });
-      const msg = `デフォルトの文体を「${describeTone(settings)}」に変更しました。`;
-
-      const quickReply = buildQuickReply([]);
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: msg,
-        quickReply,
-      });
-    }
-
-    // --- 英語タイプ設定 ---
-    if (text === 'SET_VARIANT_JP') {
-      const settings = await updateUserSettings(lineUserId, {
-        english_variant: 'JP',
-      });
-      const msg = `英語タイプを「${describeVariant(settings)}」に変更しました。`;
-
-      const quickReply = buildQuickReply([]);
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: msg,
-        quickReply,
-      });
-    }
-
-    if (text === 'SET_VARIANT_US') {
-      const settings = await updateUserSettings(lineUserId, {
-        english_variant: 'US',
-      });
-      const msg = `英語タイプを「${describeVariant(settings)}」に変更しました。`;
-
-      const quickReply = buildQuickReply([]);
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: msg,
-        quickReply,
-      });
-    }
-
-    if (text === 'SET_VARIANT_UK') {
-      const settings = await updateUserSettings(lineUserId, {
-        english_variant: 'UK',
-      });
-      const msg = `英語タイプを「${describeVariant(settings)}」に変更しました。`;
-
-      const quickReply = buildQuickReply([]);
-      return client.replyMessage(event.replyToken, {
-        type: 'text',
-        text: msg,
-        quickReply,
-      });
-    }
-
-    // --- 再トーン ---
-    if (text === 'カジュアル' || text === '丁寧' || text === 'ビジネス') {
-      return handleRetone(lineUserId, event.replyToken, text);
-    }
-
-    // --- この英文で良い ---
-    if (text === 'この英文で良い') {
-      return handleAcceptSentence(lineUserId, event.replyToken);
-    }
-
-    // --- 上記どれでもない = 翻訳・リライト本体 ---
-    return handleTranslate(lineUserId, event.replyToken, text);
-  }
-
-  // 他のイベントタイプは無視
-}
-
-// -----------------------
-// Express + LINE middleware
-// -----------------------
-app.post('/webhook', middleware(config), (req, res) => {
-  const events = req.body.events || [];
-
-  // 先に 200 を返す → タイムアウト対策
-  res.sendStatus(200);
-
-  events.forEach((event) => {
-    handleEvent(event).catch((err) => {
-      console.error('handleEvent error:', err);
-    });
-  });
-});
-
-app.get('/', (req, res) => {
-  res.send('YourTranslator bot is running.');
-});
+// ---------- サーバー起動 ----------
 
 const port = process.env.PORT || 8080;
 app.listen(port, () => {
   console.log(`Server listening on ${port}`);
-  console.log('LINE Token:', process.env.LINE_CHANNEL_ACCESS_TOKEN ? 'OK' : 'Missing');
-  console.log('LINE Secret:', process.env.LINE_CHANNEL_SECRET ? 'OK' : 'Missing');
 });

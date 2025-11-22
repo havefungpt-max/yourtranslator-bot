@@ -35,7 +35,6 @@ const openai = new OpenAI({
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'; // 一番安い系
 
-app.use(express.json());
 app.post('/webhook', middleware(lineConfig), async (req, res) => {
   const events = req.body.events;
   if (!events || events.length === 0) {

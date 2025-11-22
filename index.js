@@ -17,6 +17,9 @@ require('dotenv').config();
 // ---------- 基本セットアップ ----------
 const app = express();
 
+// ※重要：app.use(express.json()) は付けない
+// LINE middleware が独自に raw body を使うので、グローバルな JSON パーサーは NG
+
 const lineConfig = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
   channelSecret: process.env.LINE_CHANNEL_SECRET,
@@ -33,98 +36,36 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'; // 安いモデル
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'; // 安め
 
-// Webhook
-app.post('/webhook', middleware(lineConfig), async (req, res) => {
-  const events = req.body.events;
-  if (!events || events.length === 0) {
-    return res.status(200).end();
-  }
-
-  try {
-    await Promise.all(events.map(handleEvent));
-    res.status(200).end();
-  } catch (err) {
-    console.error('Error handling events:', err);
-    res.status(500).end();
-  }
-});
-
-// ---------- ユーザー情報（Supabase） ----------
-
-async function getOrCreateUser(lineUserId) {
-  const { data, error } = await supabase
-    .from('users')
-    .select('*')
-    .eq('line_user_id', lineUserId)
-    .limit(1);
-
-  if (error) {
-    console.error('Supabase select error:', error);
-    throw error;
-  }
-
-  if (data && data.length > 0) {
-    return data[0];
-  }
-
-  // デフォルト値
-  const now = new Date().toISOString();
-  const newUser = {
-    line_user_id: lineUserId,
-    level_type: 'eiken',          // 'eiken' | 'toeic' | 'rough'
-    level_value: '2',             // '5','4','3','pre2','2','pre1','1'
-    english_style: 'neutral',     // 'neutral' | 'american' | 'british'
-    usage_default: 'CHAT_FRIEND', // 'CHAT_FRIEND' | 'MAIL_INTERNAL' | 'MAIL_EXTERNAL'
-    tone_default: 'polite',       // 'casual' | 'polite' | 'business'
-    created_at: now,
-    updated_at: now,
-  };
-
-  const { data: inserted, error: insertError } = await supabase
-    .from('users')
-    .insert(newUser)
-    .select('*')
-    .single();
-
-  if (insertError) {
-    console.error('Supabase insert error:', insertError);
-    throw insertError;
-  }
-
-  return inserted;
-}
-
-async function updateUser(lineUserId, patch) {
-  const now = new Date().toISOString();
-  const { data, error } = await supabase
-    .from('users')
-    .update({ ...patch, updated_at: now })
-    .eq('line_user_id', lineUserId)
-    .select('*')
-    .single();
-
-  if (error) {
-    console.error('Supabase update error:', error);
-    throw error;
-  }
-  return data;
-}
-
-// ---------- ヘルパー：言語判定 ----------
-
+// ---------- 言語判定（改良版） ----------
+// 日本語 or 英語 or mixed をざっくり判定
 function detectLanguage(text) {
-  const hasJa = /[一-龯ぁ-んァ-ン]/.test(text);
-  const hasEn = /[A-Za-z]/.test(text);
+  const jaMatches = text.match(/[一-龯ぁ-んァ-ン]/g) || [];
+  const enMatches = text.match(/[A-Za-z]/g) || [];
 
-  if (hasJa && hasEn) return 'mixed';
-  if (hasJa) return 'ja';
-  if (hasEn) return 'en';
+  const jaCount = jaMatches.length;
+  const enCount = enMatches.length;
+
+  if (jaCount > 0 && enCount === 0) return 'ja';
+  if (enCount > 0 && jaCount === 0) return 'en';
+
+  if (jaCount > 0 && enCount > 0) {
+    const total = jaCount + enCount;
+    const enRatio = enCount / total;
+
+    // DB / API / HTTP みたいな「英字ちょっとだけ」は日本語扱いに寄せる
+    if (enRatio < 0.2) return 'ja';
+    // 逆パターン（英語メインで漢字ちょい）は英語扱い
+    if (enRatio > 0.8) return 'en';
+
+    return 'mixed';
+  }
+
   return 'other';
 }
 
-// ---------- ヘルパー：Quick Reply ----------
+// ---------- Quick Reply ヘルパー ----------
 
 function baseQuickReplyItems() {
   return [
@@ -186,7 +127,74 @@ function homeQuickReplyItems() {
   ];
 }
 
-// ---------- 表示用ラベル ----------
+// ---------- Supabase ユーザー管理 ----------
+// users テーブル想定：
+// id, line_user_id, level_type, level_value,
+// english_style, usage_default, tone_default,
+// last_source_ja, last_output_en, last_source_en, last_output_ja, last_mode, created_at, updated_at
+// 既存の level_raw / level_normalized / english_variant などは DB 側で DEFAULT を持つ想定
+
+async function getOrCreateUser(lineUserId) {
+  const { data, error } = await supabase
+    .from('users')
+    .select('*')
+    .eq('line_user_id', lineUserId)
+    .limit(1);
+
+  if (error) {
+    console.error('Supabase select error:', error);
+    throw error;
+  }
+
+  if (data && data.length > 0) {
+    return data[0];
+  }
+
+  const now = new Date().toISOString();
+  const newUser = {
+    line_user_id: lineUserId,
+    // アプリ側で使うカラム
+    level_type: 'eiken',          // 'eiken' | 'toeic' | 'rough'
+    level_value: '2',             // '5','4','3','pre2','2','pre1','1' など
+    english_style: 'neutral',     // 'neutral' | 'american' | 'british'
+    usage_default: 'CHAT_FRIEND', // 'CHAT_FRIEND' | 'MAIL_INTERNAL' | 'MAIL_EXTERNAL'
+    tone_default: 'polite',       // 'casual' | 'polite' | 'business'
+    created_at: now,
+    updated_at: now,
+    // last_* 系は NULL で OK（DB 側で NOT NULL なら DEFAULT を入れておくこと）
+  };
+
+  const { data: inserted, error: insertError } = await supabase
+    .from('users')
+    .insert(newUser)
+    .select('*')
+    .single();
+
+  if (insertError) {
+    console.error('Supabase insert error:', insertError);
+    throw insertError;
+  }
+
+  return inserted;
+}
+
+async function updateUser(lineUserId, patch) {
+  const now = new Date().toISOString();
+  const { data, error } = await supabase
+    .from('users')
+    .update({ ...patch, updated_at: now })
+    .eq('line_user_id', lineUserId)
+    .select('*')
+    .single();
+
+  if (error) {
+    console.error('Supabase update error:', error);
+    throw error;
+  }
+  return data;
+}
+
+// ---------- ラベル変換 ----------
 
 function usageSceneLabel(usage_default) {
   switch (usage_default) {
@@ -226,17 +234,24 @@ function englishStyleLabel(style) {
 function levelLabel(user) {
   if (user.level_type === 'eiken') {
     const v = (user.level_value || '').toLowerCase();
-    const map = {
-      '5': '5級',
-      '4': '4級',
-      '3': '3級',
-      '2': '2級',
-      '1': '1級',
-      pre2: '準2級',
-      pre1: '準1級',
-    };
-    const lv = map[v] || user.level_value;
-    return `英検${lv}`;
+    switch (v) {
+      case '5':
+        return '英検5級';
+      case '4':
+        return '英検4級';
+      case '3':
+        return '英検3級';
+      case 'pre2':
+        return '英検準2級';
+      case '2':
+        return '英検2級';
+      case 'pre1':
+        return '英検準1級';
+      case '1':
+        return '英検1級';
+      default:
+        return `英検${user.level_value}級`;
+    }
   }
   if (user.level_type === 'toeic') {
     return `TOEIC ${user.level_value}`;
@@ -254,12 +269,11 @@ async function generateEnglishFromJapanese({ user, sourceText, toneOverride }) {
       ? `TOEIC score range ${user.level_value}`
       : `rough level ${user.level_value}`;
 
-  const usageText =
-    {
-      CHAT_FRIEND: 'chat with friends or colleagues',
-      MAIL_INTERNAL: 'internal business email',
-      MAIL_EXTERNAL: 'external business email with clients',
-    }[user.usage_default] || 'chat with friends or colleagues';
+  const usageText = {
+    CHAT_FRIEND: 'chat with friends or colleagues',
+    MAIL_INTERNAL: 'internal business email',
+    MAIL_EXTERNAL: 'external business email with clients',
+  }[user.usage_default] || 'chat with friends or colleagues';
 
   const tone = toneOverride || user.tone_default; // 'casual' | 'polite' | 'business'
 
@@ -268,7 +282,7 @@ You are an English writing assistant for Japanese users.
 - When the user sends Japanese, translate or rewrite it into natural English.
 - Consider the user's level, usage scene, tone, and English style.
 - Output ONLY the English sentence(s). No Japanese. No explanations. No quotes.
-`.trim();
+  `.trim();
 
   const userPrompt = `
 User level: ${levelText}
@@ -279,7 +293,7 @@ Source language: Japanese
 
 Japanese text:
 ${sourceText}
-`.trim();
+  `.trim();
 
   const completion = await openai.chat.completions.create({
     model: OPENAI_MODEL,
@@ -317,14 +331,14 @@ You are an English-to-Japanese translator and tutor for Japanese learners.
 }
 
 No extra text. No comments. No Markdown. No backticks.
-`.trim();
+  `.trim();
 
   const userPrompt = `
 User level: ${levelText}
 
 English text:
 ${sourceText}
-`.trim();
+  `.trim();
 
   const completion = await openai.chat.completions.create({
     model: OPENAI_MODEL,
@@ -337,7 +351,6 @@ ${sourceText}
 
   let raw = completion.choices[0]?.message?.content || '';
 
-  // 念のため、```json などを剥がす
   raw = raw.trim();
   if (raw.startsWith('```')) {
     raw = raw.replace(/^```[a-zA-Z]*\n?/, '').replace(/```$/, '').trim();
@@ -348,7 +361,6 @@ ${sourceText}
     parsed = JSON.parse(raw);
   } catch (e) {
     console.error('JSON parse error from OpenAI:', e, raw);
-    // 最悪、全部テキストとして返す
     return {
       ja: raw,
       glossary: [],
@@ -361,103 +373,7 @@ ${sourceText}
   };
 }
 
-// ---------- メインイベントハンドラ ----------
-
-async function handleEvent(event) {
-  if (event.type !== 'message' || event.message.type !== 'text') {
-    return;
-  }
-
-  const userId = event.source.userId;
-  if (!userId) return;
-
-  const text = (event.message.text || '').trim();
-  const user = await getOrCreateUser(userId);
-
-  // 特殊コマンド（ミックス入力用）
-  if (text.startsWith('TRANSLATE_TO_EN:::')) {
-    const original = text.replace('TRANSLATE_TO_EN:::', '');
-    return handleJaToEn(original, event.replyToken, user, { force: 'en' });
-  }
-  if (text.startsWith('TRANSLATE_TO_JA:::')) {
-    const original = text.replace('TRANSLATE_TO_JA:::', '');
-    return handleEnToJa(original, event.replyToken, user, { force: 'ja' });
-  }
-
-  // 設定・ヘルプ系
-  if (text === 'ヘルプ') {
-    return replyHelp(event.replyToken);
-  }
-  if (text === 'ホーム') {
-    return replyHome(event.replyToken, user);
-  }
-  if (text === '使い方') {
-    return replyUsage(event.replyToken);
-  }
-
-  // 設定フロー
-  if (text === '[設定] レベル') {
-    return replyLevelRoot(event.replyToken);
-  }
-  if (text === '[設定] 英検レベル') {
-    return replyLevelEiken(event.replyToken);
-  }
-  if (text.startsWith('SET_LEVEL_EIKEN_')) {
-    return handleSetLevelEiken(event.replyToken, user, text);
-  }
-
-  if (text === '[設定] 用途') {
-    return replyUsageScene(event.replyToken);
-  }
-  if (text.startsWith('SET_USAGE_')) {
-    return handleSetUsageScene(event.replyToken, user, text);
-  }
-
-  if (text === '[設定] 文体') {
-    return replyToneSetting(event.replyToken);
-  }
-  if (text.startsWith('SET_TONE_')) {
-    return handleSetTone(event.replyToken, user, text);
-  }
-
-  if (text === '[設定] 英語タイプ') {
-    return replyEnglishStyle(event.replyToken);
-  }
-  if (text.startsWith('SET_EN_STYLE_')) {
-    return handleSetEnglishStyle(event.replyToken, user, text);
-  }
-
-  // トーン変更
-  if (text.startsWith('トーン:')) {
-    const toneLabelJa = text.replace('トーン:', '');
-    return handleToneChange(event.replyToken, user, toneLabelJa);
-  }
-
-  // 「この英文でOK」 → コピペ用＋ワンポイント
-  if (text.includes('この英文で')) {
-    return handleAcceptCurrentEnglish(event.replyToken, user);
-  }
-
-  // ここから本文処理
-  const lang = detectLanguage(text);
-
-  if (lang === 'ja') {
-    return handleJaToEn(text, event.replyToken, user);
-  } else if (lang === 'en') {
-    return handleEnToJa(text, event.replyToken, user);
-  } else if (lang === 'mixed') {
-    return handleMixed(text, event.replyToken);
-  } else {
-    // その他の言語は対象外
-    return lineClient.replyMessage(event.replyToken, {
-      type: 'text',
-      text: '今は日本語と英語だけをサポートしています。\n日本語か英語で送ってみてください。',
-      quickReply: { items: baseQuickReplyItems() },
-    });
-  }
-}
-
-// ---------- 各種返信ハンドラ ----------
+// ---------- 各種返信 ----------
 
 async function replyHelp(replyToken) {
   const message = {
@@ -468,7 +384,7 @@ async function replyHelp(replyToken) {
       '・英語で送る → 和訳＋むずかしめ単語のミニ解説\n' +
       '・日本語＋英語まじり → 英訳 / 和訳を選択\n\n' +
       'まずは「ホーム」でレベルやよく使う場面をゆるく決めておくとラクです。\n' +
-      '困ったらまた「ヘルプ」と送ってください。',
+      '迷ったらまた「ヘルプ」と送ってください。',
     quickReply: { items: baseQuickReplyItems() },
   };
   return lineClient.replyMessage(replyToken, message);
@@ -502,7 +418,7 @@ async function replyUsage(replyToken) {
     '3. 英文が出たら、クイックメニューで\n' +
     '   ・カジュアル / 丁寧 / ビジネス に言い換え\n' +
     '   ・「この英文でOK」で、本文だけ＋ワンポイントレッスン\n\n' +
-    '深く考えなくて大丈夫なので、送りたい文をそのまま投げてみてください。';
+    '細かいことは気にせず、送りたい文をそのまま投げてみてください。';
 
   const message = {
     type: 'text',
@@ -589,7 +505,7 @@ async function replyLevelEiken(replyToken) {
 
 async function handleSetLevelEiken(replyToken, user, text) {
   const code = text.replace('SET_LEVEL_EIKEN_', ''); // 5,4,3,PRE2,2,PRE1,1
-  const value = code.toLowerCase(); // pre2, pre1 などに揃える
+  const value = code.toLowerCase(); // DB には "5","4","3","pre2","2","pre1","1"
 
   const updated = await updateUser(user.line_user_id, {
     level_type: 'eiken',
@@ -598,9 +514,7 @@ async function handleSetLevelEiken(replyToken, user, text) {
 
   const message = {
     type: 'text',
-    text:
-      `レベルを「${levelLabel(updated)}」のイメージで登録しました。\n` +
-      '日本語か英語で文を送ってみてください。',
+    text: `レベルを「${levelLabel(updated)}」のイメージで登録しました。\n日本語か英語で文を送ってみてください。`,
     quickReply: { items: baseQuickReplyItems() },
   };
   return lineClient.replyMessage(replyToken, message);
@@ -759,7 +673,7 @@ async function handleSetEnglishStyle(replyToken, user, text) {
   return lineClient.replyMessage(replyToken, message);
 }
 
-// -- トーン変更（クイックメニュー） --
+// -- トーン変更（クイックリプライから） --
 
 async function handleToneChange(replyToken, user, toneLabelJa) {
   if (!user.last_source_ja) {
@@ -794,7 +708,8 @@ async function handleToneChange(replyToken, user, toneLabelJa) {
   return lineClient.replyMessage(replyToken, message);
 }
 
-// -- 「この英文でOK」 --
+// -- 「この英文でOK」 → コピペ用＋ワンポイント --
+// ★アップグレード例は、用途に合わせたトーンを維持するように変更
 
 async function handleAcceptCurrentEnglish(replyToken, user) {
   const en = user.last_output_en;
@@ -806,23 +721,42 @@ async function handleAcceptCurrentEnglish(replyToken, user) {
     });
   }
 
-  // コピペ用の英文だけ
+  const usageText = {
+    CHAT_FRIEND: 'casual chat with friends or colleagues (chat apps, DMs, etc.)',
+    MAIL_INTERNAL: 'polite but not overly formal internal business emails',
+    MAIL_EXTERNAL: 'formal and polite external business emails with clients',
+  }[user.usage_default] || 'casual chat with friends or colleagues (chat apps, DMs, etc.)';
+
   const copyMessage = {
     type: 'text',
     text: en,
   };
 
-  // ワンポイントレッスン
   const systemPrompt = `
 You are an English coach for Japanese learners.
-The user has just decided to use the following English sentence.
-Give ONE short upgrade example and a brief explanation in Japanese.
+The user has just decided to use the following English sentence in this context:
+- Usage: ${usageText}
+
+Your task:
+1. Suggest ONE upgraded version of the sentence.
+2. Keep the SAME tone and level of formality that is appropriate for the given usage.
+3. Do NOT make the sentence more casual than necessary.
+4. Do NOT turn it into a completely different tone (e.g. casual -> very formal, or formal -> too casual).
+
+Output format (in Japanese, except the upgraded English sentence):
+
+アップグレード例:
+"<Upgraded English sentence>"
+
+解説:
+・どこをどう良くしたか（日本語で1〜2文）
+・ニュアンスの違い（あれば簡単に）
 
 Rules:
-- Output in Japanese, except for the example English sentence.
-- 3–5 lines.
-- Tone: friendly and supportive, not teacher-ish.
-`.trim();
+- 3〜5行。
+- 日本語はフレンドリーだが、なれなれしくしない。
+- 元の英文とほぼ同じ言い換えは避けて、違いが分かる表現にする。
+  `.trim();
 
   const userPrompt = `English sentence:\n${en}`;
 
@@ -947,6 +881,118 @@ async function handleMixed(text, replyToken) {
 
   return lineClient.replyMessage(replyToken, message);
 }
+
+// ---------- メインイベントハンドラ ----------
+
+async function handleEvent(event) {
+  if (event.type !== 'message' || event.message.type !== 'text') {
+    return;
+  }
+
+  const userId = event.source.userId;
+  if (!userId) return;
+
+  const text = (event.message.text || '').trim();
+  const user = await getOrCreateUser(userId);
+
+  // 特殊コマンド（混在テキストからの分岐用）
+  if (text.startsWith('TRANSLATE_TO_EN:::')) {
+    const original = text.replace('TRANSLATE_TO_EN:::', '');
+    return handleJaToEn(original, event.replyToken, user, { force: 'en' });
+  }
+  if (text.startsWith('TRANSLATE_TO_JA:::')) {
+    const original = text.replace('TRANSLATE_TO_JA:::', '');
+    return handleEnToJa(original, event.replyToken, user, { force: 'ja' });
+  }
+
+  // 設定・ヘルプ系
+  if (text === 'ヘルプ') {
+    return replyHelp(event.replyToken);
+  }
+  if (text === 'ホーム') {
+    return replyHome(event.replyToken, user);
+  }
+  if (text === '使い方') {
+    return replyUsage(event.replyToken);
+  }
+
+  // 設定フロー
+  if (text === '[設定] レベル') {
+    return replyLevelRoot(event.replyToken);
+  }
+  if (text === '[設定] 英検レベル') {
+    return replyLevelEiken(event.replyToken);
+  }
+  if (text.startsWith('SET_LEVEL_EIKEN_')) {
+    return handleSetLevelEiken(event.replyToken, user, text);
+  }
+
+  if (text === '[設定] 用途') {
+    return replyUsageScene(event.replyToken);
+  }
+  if (text.startsWith('SET_USAGE_')) {
+    return handleSetUsageScene(event.replyToken, user, text);
+  }
+
+  if (text === '[設定] 文体') {
+    return replyToneSetting(event.replyToken);
+  }
+  if (text.startsWith('SET_TONE_')) {
+    return handleSetTone(event.replyToken, user, text);
+  }
+
+  if (text === '[設定] 英語タイプ') {
+    return replyEnglishStyle(event.replyToken);
+  }
+  if (text.startsWith('SET_EN_STYLE_')) {
+    return handleSetEnglishStyle(event.replyToken, user, text);
+  }
+
+  // トーン変更
+  if (text.startsWith('トーン:')) {
+    const toneLabel = text.replace('トーン:', '');
+    return handleToneChange(event.replyToken, user, toneLabel);
+  }
+
+  // 「この英文でOK」
+  if (text.includes('この英文で')) {
+    return handleAcceptCurrentEnglish(event.replyToken, user);
+  }
+
+  // 本文処理
+  const lang = detectLanguage(text);
+
+  if (lang === 'ja') {
+    return handleJaToEn(text, event.replyToken, user);
+  } else if (lang === 'en') {
+    return handleEnToJa(text, event.replyToken, user);
+  } else if (lang === 'mixed') {
+    return handleMixed(text, event.replyToken);
+  } else {
+    return lineClient.replyMessage(event.replyToken, {
+      type: 'text',
+      text: '今は日本語と英語だけをサポートしています。\n日本語か英語で送ってみてください。',
+      quickReply: { items: baseQuickReplyItems() },
+    });
+  }
+}
+
+// ---------- Webhook エンドポイント ----------
+
+app.post('/webhook', middleware(lineConfig), async (req, res) => {
+  const events = req.body.events;
+  if (!events || events.length === 0) {
+    return res.status(200).end();
+  }
+
+  try {
+    await Promise.all(events.map(handleEvent));
+    res.status(200).end();
+  } catch (err) {
+    console.error('Error handling events:', err);
+    res.status(500).end();
+  }
+});
 
 // ---------- サーバー起動 ----------
 

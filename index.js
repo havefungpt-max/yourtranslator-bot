@@ -459,6 +459,19 @@ function levelLabel(user) {
   return `ざっくり ${user.level_value}`;
 }
 
+async function handleSetLevelEiken(replyToken, user, text) {
+  ...
+  const updated = await updateUser(user.line_user_id, {
+    level_type: 'eiken',
+    level_value: value,
+  });
+
+  const message = {
+    type: 'text',
+    text: `レベルを「${levelLabel(updated)}」のイメージで登録しました。\n日本語か英語で文を送ってみてください。`,
+    quickReply: { items: baseQuickReplyItems() },
+  };
+}
 async function replyHome(replyToken, user) {
   const text =
     'YourTranslator ホーム\n\n' +

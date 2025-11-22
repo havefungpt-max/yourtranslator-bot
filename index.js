@@ -33,8 +33,9 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'; // 一番安い系
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini'; // 安いモデル
 
+// Webhook
 app.post('/webhook', middleware(lineConfig), async (req, res) => {
   const events = req.body.events;
   if (!events || events.length === 0) {
@@ -72,9 +73,9 @@ async function getOrCreateUser(lineUserId) {
   const now = new Date().toISOString();
   const newUser = {
     line_user_id: lineUserId,
-    level_type: 'eiken',        // 'eiken' | 'toeic' | 'rough'
-    level_value: '2',           // 例: '5','4','3','pre2','2','pre1','1'
-    english_style: 'neutral',   // 'neutral' | 'american' | 'british'
+    level_type: 'eiken',          // 'eiken' | 'toeic' | 'rough'
+    level_value: '2',             // '5','4','3','pre2','2','pre1','1'
+    english_style: 'neutral',     // 'neutral' | 'american' | 'british'
     usage_default: 'CHAT_FRIEND', // 'CHAT_FRIEND' | 'MAIL_INTERNAL' | 'MAIL_EXTERNAL'
     tone_default: 'polite',       // 'casual' | 'polite' | 'business'
     created_at: now,
@@ -185,6 +186,64 @@ function homeQuickReplyItems() {
   ];
 }
 
+// ---------- 表示用ラベル ----------
+
+function usageSceneLabel(usage_default) {
+  switch (usage_default) {
+    case 'CHAT_FRIEND':
+      return '友だち・同僚とのチャット';
+    case 'MAIL_INTERNAL':
+      return '社内メール';
+    case 'MAIL_EXTERNAL':
+      return '社外メール';
+    default:
+      return '友だち・同僚とのチャット';
+  }
+}
+
+function toneLabel(tone_default) {
+  switch (tone_default) {
+    case 'casual':
+      return 'カジュアル';
+    case 'business':
+      return 'ビジネス';
+    default:
+      return '丁寧';
+  }
+}
+
+function englishStyleLabel(style) {
+  switch (style) {
+    case 'american':
+      return 'アメリカ寄り';
+    case 'british':
+      return 'イギリス寄り';
+    default:
+      return '日本人向け（無難）';
+  }
+}
+
+function levelLabel(user) {
+  if (user.level_type === 'eiken') {
+    const v = (user.level_value || '').toLowerCase();
+    const map = {
+      '5': '5級',
+      '4': '4級',
+      '3': '3級',
+      '2': '2級',
+      '1': '1級',
+      pre2: '準2級',
+      pre1: '準1級',
+    };
+    const lv = map[v] || user.level_value;
+    return `英検${lv}`;
+  }
+  if (user.level_type === 'toeic') {
+    return `TOEIC ${user.level_value}`;
+  }
+  return `ざっくり ${user.level_value}`;
+}
+
 // ---------- OpenAI 呼び出し ----------
 
 async function generateEnglishFromJapanese({ user, sourceText, toneOverride }) {
@@ -195,11 +254,12 @@ async function generateEnglishFromJapanese({ user, sourceText, toneOverride }) {
       ? `TOEIC score range ${user.level_value}`
       : `rough level ${user.level_value}`;
 
-  const usageText = {
-    CHAT_FRIEND: 'chat with friends or colleagues',
-    MAIL_INTERNAL: 'internal business email',
-    MAIL_EXTERNAL: 'external business email with clients',
-  }[user.usage_default] || 'chat with friends or colleagues';
+  const usageText =
+    {
+      CHAT_FRIEND: 'chat with friends or colleagues',
+      MAIL_INTERNAL: 'internal business email',
+      MAIL_EXTERNAL: 'external business email with clients',
+    }[user.usage_default] || 'chat with friends or colleagues';
 
   const tone = toneOverride || user.tone_default; // 'casual' | 'polite' | 'business'
 
@@ -208,7 +268,7 @@ You are an English writing assistant for Japanese users.
 - When the user sends Japanese, translate or rewrite it into natural English.
 - Consider the user's level, usage scene, tone, and English style.
 - Output ONLY the English sentence(s). No Japanese. No explanations. No quotes.
-  `.trim();
+`.trim();
 
   const userPrompt = `
 User level: ${levelText}
@@ -219,7 +279,7 @@ Source language: Japanese
 
 Japanese text:
 ${sourceText}
-  `.trim();
+`.trim();
 
   const completion = await openai.chat.completions.create({
     model: OPENAI_MODEL,
@@ -257,14 +317,14 @@ You are an English-to-Japanese translator and tutor for Japanese learners.
 }
 
 No extra text. No comments. No Markdown. No backticks.
-  `.trim();
+`.trim();
 
   const userPrompt = `
 User level: ${levelText}
 
 English text:
 ${sourceText}
-  `.trim();
+`.trim();
 
   const completion = await openai.chat.completions.create({
     model: OPENAI_MODEL,
@@ -369,8 +429,8 @@ async function handleEvent(event) {
 
   // トーン変更
   if (text.startsWith('トーン:')) {
-    const toneLabel = text.replace('トーン:', '');
-    return handleToneChange(event.replyToken, user, toneLabel);
+    const toneLabelJa = text.replace('トーン:', '');
+    return handleToneChange(event.replyToken, user, toneLabelJa);
   }
 
   // 「この英文でOK」 → コピペ用＋ワンポイント
@@ -414,64 +474,6 @@ async function replyHelp(replyToken) {
   return lineClient.replyMessage(replyToken, message);
 }
 
-function usageSceneLabel(usage_default) {
-  switch (usage_default) {
-    case 'CHAT_FRIEND':
-      return '友だち・同僚とのチャット';
-    case 'MAIL_INTERNAL':
-      return '社内メール';
-    case 'MAIL_EXTERNAL':
-      return '社外メール';
-    default:
-      return '友だち・同僚とのチャット';
-  }
-}
-
-function toneLabel(tone_default) {
-  switch (tone_default) {
-    case 'casual':
-      return 'カジュアル';
-    case 'business':
-      return 'ビジネス';
-    default:
-      return '丁寧';
-  }
-}
-
-function englishStyleLabel(style) {
-  switch (style) {
-    case 'american':
-      return 'アメリカ寄り';
-    case 'british':
-      return 'イギリス寄り';
-    default:
-      return '日本人向け（無難）';
-  }
-}
-
-function levelLabel(user) {
-  if (user.level_type === 'eiken') {
-    return `英検${user.level_value}級`;
-  }
-  if (user.level_type === 'toeic') {
-    return `TOEIC ${user.level_value}`;
-  }
-  return `ざっくり ${user.level_value}`;
-}
-
-async function handleSetLevelEiken(replyToken, user, text) {
-  ...
-  const updated = await updateUser(user.line_user_id, {
-    level_type: 'eiken',
-    level_value: value,
-  });
-
-  const message = {
-    type: 'text',
-    text: `レベルを「${levelLabel(updated)}」のイメージで登録しました。\n日本語か英語で文を送ってみてください。`,
-    quickReply: { items: baseQuickReplyItems() },
-  };
-}
 async function replyHome(replyToken, user) {
   const text =
     'YourTranslator ホーム\n\n' +
@@ -587,9 +589,8 @@ async function replyLevelEiken(replyToken) {
 
 async function handleSetLevelEiken(replyToken, user, text) {
   const code = text.replace('SET_LEVEL_EIKEN_', ''); // 5,4,3,PRE2,2,PRE1,1
-  let value = code.toLowerCase();
+  const value = code.toLowerCase(); // pre2, pre1 などに揃える
 
-  // DB には "5","4","3","pre2","2","pre1","1" のように入れる
   const updated = await updateUser(user.line_user_id, {
     level_type: 'eiken',
     level_value: value,
@@ -597,7 +598,9 @@ async function handleSetLevelEiken(replyToken, user, text) {
 
   const message = {
     type: 'text',
-    text: `レベルを「英検${levelLabel(updated)}」のイメージで登録しました。\n日本語か英語で文を送ってみてください。`,
+    text:
+      `レベルを「${levelLabel(updated)}」のイメージで登録しました。\n` +
+      '日本語か英語で文を送ってみてください。',
     quickReply: { items: baseQuickReplyItems() },
   };
   return lineClient.replyMessage(replyToken, message);
@@ -756,7 +759,7 @@ async function handleSetEnglishStyle(replyToken, user, text) {
   return lineClient.replyMessage(replyToken, message);
 }
 
-// -- トーン変更 --
+// -- トーン変更（クイックメニュー） --
 
 async function handleToneChange(replyToken, user, toneLabelJa) {
   if (!user.last_source_ja) {
@@ -778,7 +781,6 @@ async function handleToneChange(replyToken, user, toneLabelJa) {
     toneOverride,
   });
 
-  // last_output_en を更新
   await updateUser(user.line_user_id, {
     last_output_en: en,
     last_mode: 'JA_TO_EN',
@@ -820,7 +822,7 @@ Rules:
 - Output in Japanese, except for the example English sentence.
 - 3–5 lines.
 - Tone: friendly and supportive, not teacher-ish.
-  `.trim();
+`.trim();
 
   const userPrompt = `English sentence:\n${en}`;
 
@@ -857,14 +859,12 @@ Rules:
 // -- 日本語 → 英語 --
 
 async function handleJaToEn(text, replyToken, user, options = {}) {
-  // 混在モードから強制英訳で呼ばれた、などの future 用
   const en = await generateEnglishFromJapanese({
     user,
     sourceText: text,
     toneOverride: null,
   });
 
-  // DB に直近を保存
   await updateUser(user.line_user_id, {
     last_source_ja: text,
     last_output_en: en,
@@ -873,7 +873,7 @@ async function handleJaToEn(text, replyToken, user, options = {}) {
 
   const message = {
     type: 'text',
-    text: en, // 設定ヘッダは出さない
+    text: en,
     quickReply: { items: toneQuickReplyItems() },
   };
   return lineClient.replyMessage(replyToken, message);
@@ -899,7 +899,6 @@ async function handleEnToJa(text, replyToken, user, options = {}) {
     });
   }
 
-  // 直近を保存（必要になったら使う）
   await updateUser(user.line_user_id, {
     last_source_en: text,
     last_output_ja: ja,

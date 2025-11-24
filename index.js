@@ -59,7 +59,7 @@ async function getOrCreateUser(lineUserId) {
     line_user_id: lineUserId,
     level_type: 'eiken',           // 'eiken' | 'toeic' | 'rough'
     level_value: '2',              // '5','4','3','pre2','2','pre1','1' など
-    english_style: 'japanese',     // UI上は固定で扱う
+    english_style: 'japanese',     // UI上は固定想定
     usage_default: 'CHAT_FRIEND',  // 'CHAT_FRIEND' | 'MAIL_INTERNAL' | 'MAIL_EXTERNAL'
     tone_default: 'polite',        // 'casual' | 'polite' | 'business'
     created_at: now,
@@ -111,16 +111,16 @@ function detectLanguage(text) {
 
 // ---------- ヘルパー：Quick Reply ----------
 
-function settingsQuickReplyItem() {
+function homeButton() {
   return {
     type: 'action',
-    action: { type: 'message', label: '⚙ 設定', text: 'ホーム' },
+    action: { type: 'message', label: '🏠 ホーム', text: 'ホーム' },
   };
 }
 
 // includeHelp = true のときだけ「使い方」も出す
 function baseQuickReplyItems(includeHelp = true) {
-  const items = [settingsQuickReplyItem()];
+  const items = [homeButton()];
   if (includeHelp) {
     items.push({
       type: 'action',
@@ -149,7 +149,11 @@ function toneQuickReplyItems() {
       type: 'action',
       action: { type: 'message', label: '💼 ビジネスに', text: 'トーン:ビジネス' },
     },
-    settingsQuickReplyItem(),
+    homeButton(),
+    {
+      type: 'action',
+      action: { type: 'message', label: '❓ 使い方', text: '使い方' },
+    },
   ];
 }
 
@@ -167,6 +171,14 @@ function homeQuickReplyItems() {
     {
       type: 'action',
       action: { type: 'message', label: '🎨 文体', text: '[設定] 文体' },
+    },
+    {
+      type: 'action',
+      action: {
+        type: 'message',
+        label: '🧩 かんたん設定',
+        text: '[設定] かんたんプリセット',
+      },
     },
     {
       type: 'action',
@@ -250,11 +262,7 @@ function levelLabel(user) {
 
 // ホーム表示用（設定内容は出さない）
 function buildHomeText(user) {
-  return (
-    '🏠 YourTranslator ホーム\n\n' +
-    '翻訳したい日本語か英語の文を、そのまま送ってください。\n\n' +
-    '設定を変えたいときは、下のボタンからどうぞ。'
-  );
+  return '翻訳したい日本語か英語の文を、そのまま送ってください。';
 }
 
 // 設定内容を出したいときはこちらを使う
@@ -456,7 +464,6 @@ Concept:
 
 Output format (in Japanese, except for the English example):
 
-✨ よりネイティブに近づけた表現なら、たとえば:
 <one native-like English example>
 
 🔎 ポイント:
@@ -467,6 +474,8 @@ Output format (in Japanese, except for the English example):
 
 Rules:
 - Do NOT restate the original user sentence.
+- Do NOT出力 any title line like "✨ よりネイティブに近づけた表現なら〜".
+- Just start with the English example, then the Japanese「🔎 ポイント:」行。
 - Total 3〜7行くらいに収める。
 - トーンはフレンドリーで、上から目線にならない。
 - 日本語はできるだけシンプルに。
@@ -637,7 +646,7 @@ async function replyUsage(replyToken) {
   const text =
     '📖 使い方ガイド\n\n' +
     '1️⃣ まずは設定\n' +
-    '・「ホーム」→ レベル / 用途 / 文体 をざっくり決める\n' +
+    '・「ホーム」→ レベル / 用途 / 文体 / かんたん設定 をざっくり決める\n' +
     '・「🎯 レベル」から、英検 / TOEIC / かんたんテスト で自分のレベルを選ぶ\n\n' +
     '2️⃣ 日本語で送ると…\n' +
     '・そのままの意味で使える英文にして返します\n' +
@@ -666,7 +675,9 @@ async function replyUsage(replyToken) {
 
 async function replyLevelTestIntro(replyToken) {
   const text =
-    '📘 かんたんレベルチェック\n\n' +
+    '📘 かんたんレベルチェッ
+
+ク\n\n' +
     '次の3つの英文のうち、「自分ならこう書きそうだな」と感じるものを選んでください。\n' +
     '番号が大きくなるほど、単語や文法のレベルが少しずつ上がっていきます。\n\n' +
     '1) I like watching movies and playing games in my free time.\n' +
@@ -751,11 +762,8 @@ async function replyLevelRoot(replyToken) {
       '🎯 レベルの決め方を選んでください。\n\n' +
       '・英検：あなたの英語力を英検の級で設定する\n' +
       '・TOEIC：TOEICスコア帯でレベルを設定する\n' +
-      '・かんたんテスト：3つの英文から感覚で選ぶだけ\n' +
-      '・とりあえず決めたい：出したい英文のイメージからまとめて設定\n\n' +
-      '例）\n' +
-      '・英検3級イメージ：I went to Tokyo with my family last weekend.\n' +
-      '・英検1級イメージ：We need to align on our long-term strategy before making this decision.',
+      '・かんたんテスト：3つの英文から感覚で選ぶだけ\n\n' +
+      '「どれがいいかよく分からない」ときは、ホーム画面の「🧩 かんたん設定」からまとめて設定するのがおすすめです。',
     quickReply: {
       items: [
         {
@@ -774,14 +782,6 @@ async function replyLevelRoot(replyToken) {
             text: '今すぐテストしてみる',
           },
         },
-        {
-          type: 'action',
-          action: {
-            type: 'message',
-            label: 'とりあえず決めたい',
-            text: '[設定] かんたんプリセット',
-          },
-        },
       ],
     },
   };
@@ -791,7 +791,11 @@ async function replyLevelRoot(replyToken) {
 async function replyLevelEiken(replyToken) {
   const message = {
     type: 'text',
-    text: '英検の級を選んでください。',
+    text:
+      '英検の級を選んでください。\n\n' +
+      '例）\n' +
+      '・英検3級イメージ：I went to Tokyo with my family last weekend.\n' +
+      '・英検1級イメージ：We need to align on our long-term strategy before making this decision.',
     quickReply: {
       items: [
         {
@@ -872,15 +876,16 @@ async function replyLevelToeic(replyToken) {
   return lineClient.replyMessage(replyToken, message);
 }
 
-// 「とりあえず決めたい」用：イメージで4択
+// 「かんたん設定」用：イメージで4択
 async function replyLevelPreset(replyToken) {
   const text =
-    '🧩 出してほしい英文のイメージを選んでください。\n\n' +
+    '🧩 かんたん設定\n\n' +
+    '出してほしい英文のイメージを選んでください。\n\n' +
     '1) やさしめのシンプル英語（友だち・同僚チャット中心）\n' +
     '2) ふつうのビジネス英語（社内メール中心）\n' +
     '3) かっちりめのビジネス英語（社外メール中心）\n' +
     '4) かなりネイティブ寄りの英語でもOK\n\n' +
-    'あとで細かく変えたくなったら、「ホーム」からレベルや用途を調整できます。';
+    '選んだあとに、その設定なら「だいたいこんな英文になりそう」というサンプルも表示します。';
 
   const message = {
     type: 'text',
@@ -975,6 +980,8 @@ async function handleSetLevelToeic(replyToken, user, text) {
 async function handleSetLevelPreset(replyToken, user, text) {
   const code = text.replace('SET_LEVEL_PRESET_', '').trim();
   let patch = {};
+  let exampleJa = '';
+  let exampleEn = '';
 
   if (code === '1') {
     patch = {
@@ -983,6 +990,8 @@ async function handleSetLevelPreset(replyToken, user, text) {
       usage_default: 'CHAT_FRIEND',
       tone_default: 'casual',
     };
+    exampleJa = '明日のランチ、一緒にどう？';
+    exampleEn = "Let's have lunch together tomorrow.";
   } else if (code === '2') {
     patch = {
       level_type: 'eiken',
@@ -990,6 +999,8 @@ async function handleSetLevelPreset(replyToken, user, text) {
       usage_default: 'MAIL_INTERNAL',
       tone_default: 'polite',
     };
+    exampleJa = 'さきほどお送りした資料をご確認いただけますか？';
+    exampleEn = 'Could you take a look at the materials I sent earlier?';
   } else if (code === '3') {
     patch = {
       level_type: 'eiken',
@@ -997,6 +1008,8 @@ async function handleSetLevelPreset(replyToken, user, text) {
       usage_default: 'MAIL_EXTERNAL',
       tone_default: 'business',
     };
+    exampleJa = '本件について、今週中にご意見をいただけますと幸いです。';
+    exampleEn = 'We would appreciate it if you could share your feedback on this matter within this week.';
   } else if (code === '4') {
     patch = {
       level_type: 'eiken',
@@ -1004,6 +1017,8 @@ async function handleSetLevelPreset(replyToken, user, text) {
       usage_default: 'MAIL_EXTERNAL',
       tone_default: 'business',
     };
+    exampleJa = '今回の変更が長期的な戦略にどのような影響を与えるか、整理しておきたいです。';
+    exampleEn = 'I would like to clarify how this change will affect our long-term strategy.';
   } else {
     // 想定外の値なら何もしない
     return lineClient.replyMessage(replyToken, {
@@ -1018,7 +1033,10 @@ async function handleSetLevelPreset(replyToken, user, text) {
   const textReply =
     '🧩 ざっくり設定を反映しました。\n\n' +
     buildSettingsSummary(updated) +
-    '\nあとから細かく変えたくなったら、「ホーム」→ 各設定ボタンから調整できます。';
+    '\n例）この設定なら、だいたいこんなイメージの英文になります：\n' +
+    `・日本語：${exampleJa}\n` +
+    `・英語：${exampleEn}\n\n` +
+    'あとから細かく変えたくなったら、「ホーム」→ 各設定ボタンから調整できます。';
 
   const message = {
     type: 'text',
@@ -1038,7 +1056,7 @@ async function replyUsageScene(replyToken) {
       '📮 よく使う場面を選んでください。\n\n' +
       '同じ内容でも、場面によって英語が少し変わります。\n\n' +
       '例）「明日のランチ、一緒にどう？」\n' +
-      '・友だち・同僚チャット：Let\'s grab lunch tomorrow.\n' +
+      "・友だち・同僚チャット：Let's grab lunch tomorrow.\n" +
       '・社内メール：Could we have lunch together tomorrow?\n' +
       '・社外メール：I was wondering if you would be available for lunch tomorrow.',
     quickReply: {
@@ -1162,11 +1180,20 @@ async function handleToneChange(replyToken, user, toneLabelJa) {
   if (toneLabelJa.includes('丁寧')) toneOverride = 'polite';
   if (toneLabelJa.includes('ビジネス')) toneOverride = 'business';
 
+  const previousEn = user.last_output_en || '';
+
   const en = await generateEnglishFromJapanese({
     user,
     sourceText: user.last_source_ja,
     toneOverride,
   });
+
+  let textToSend = en;
+  if (previousEn && previousEn.trim() === en.trim()) {
+    textToSend =
+      en +
+      '\n\n（💬 この文は文体を変えてもほぼ同じ表現になるので、カジュアルでもこのまま使えます。）';
+  }
 
   const updated = await updateUser(user.line_user_id, {
     last_output_en: en,
@@ -1175,7 +1202,7 @@ async function handleToneChange(replyToken, user, toneLabelJa) {
 
   const message = {
     type: 'text',
-    text: updated.last_output_en || en,
+    text: textToSend,
     quickReply: { items: toneQuickReplyItems() },
   };
   return lineClient.replyMessage(replyToken, message);
@@ -1204,9 +1231,10 @@ async function handleAcceptCurrentEnglish(replyToken, user) {
     type: 'text',
     text:
       (lessonText
-        ? '✨ よりネイティブに近づけた表現なら、たとえば\n------------------------------\n' + lessonText
+        ? '✨ よりネイティブに近づけた表現なら、たとえば\n------------------------------\n' +
+          lessonText
         : 'ネイティブ寄りの別案の生成に失敗しましたが、英文自体はそのまま使って大丈夫です。'),
-    quickReply: { items: baseQuickReplyItems(false) },
+    quickReply: { items: baseQuickReplyItems(true) },
   };
 
   return lineClient.replyMessage(replyToken, message);

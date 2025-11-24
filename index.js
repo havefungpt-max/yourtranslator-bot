@@ -100,7 +100,7 @@ async function updateUser(lineUserId, patch) {
 
 function detectLanguage(text) {
   const hasJa = /[一-龯ぁ-んァ-ン]/.test(text);
-  // 小文字を含む英字のみ英語扱いにする（AI, DB 単体は英語と見なさない）
+  // 英語判定は小文字のみを見る：AI / DB だけで英語扱いしない
   const hasEn = /[a-z]/.test(text);
 
   if (hasJa && hasEn) return 'mixed';
@@ -247,8 +247,10 @@ function levelLabel(user) {
 function buildHomeText(user) {
   return (
     '🏠 YourTranslator ホーム\n\n' +
-    'YourTranslator は、あなたの英語レベルと場面に合わせて\n' +
-    '「これくらいなら自分で書けそう」という英文を一緒に作るボットです。\n\n' +
+    'YourTranslator は、キレイすぎる翻訳ツールや AI の英語ではなく、\n' +
+    'あなたの英語レベルと場面に合わせて\n' +
+    '「自分ならこう書くな」と感じる英文を一緒に作るボットです。\n' +
+    '英文を貼ってもらえれば、英語⇄日本語の翻訳もお手伝いします。\n\n' +
     'いまの設定はこんな感じです：\n' +
     `・レベル：${levelLabel(user)}\n` +
     `・よく使う場面：${usageSceneLabel(user.usage_default)}\n` +
@@ -304,7 +306,7 @@ You are an English writing assistant for Japanese users.
 
 Concept:
 - The goal is to create sentences that feel like:
-  "This is about the level I could write myself," given the user's level and context.
+  "This is how I would naturally write it," given the user's level, usual style, and context.
 
 Rules:
 - When the user sends Japanese, translate or rewrite it into natural English.
@@ -375,10 +377,6 @@ Tasks:
 4. Optionally, if there is a "movie-style" or idiomatic expression, you can add a note about how it is often paraphrased in Japanese subtitles.
 
 User level will be given (e.g., EIKEN or TOEIC band), so keep explanations simple.
-
-Important:
-- "term" MUST be written in English letters (A–Z or a–z). NEVER output Japanese in "term".
-- Focus on English vocabulary and expressions, not Japanese words.
 
 Return ONLY a JSON object with this shape:
 
@@ -606,8 +604,9 @@ async function replyHelp(replyToken) {
     type: 'text',
     text:
       '💡 YourTranslator へようこそ\n\n' +
-      'YourTranslator は、あなたの英語レベルと「使う場面」に合わせて\n' +
-      '『これくらいなら自分で書けそう』という英文を一緒に作るボットです。\n\n' +
+      'YourTranslator は、キレイすぎる翻訳ツールや AI の英語ではなく、\n' +
+      'あなたの英語レベルと「使う場面」に合わせて\n' +
+      '『自分ならこう書くな』と感じる英文を一緒に作るボットです。\n\n' +
       '📝 できること\n' +
       '・日本語で送る → 英文を作成\n' +
       '・英語で送る → 和訳＋むずかしめ単語＆文法のミニ解説\n' +
@@ -667,10 +666,10 @@ async function replyUsage(replyToken) {
 async function replyLevelTestIntro(replyToken) {
   const text =
     '📘 かんたんレベルチェック\n\n' +
-    '次の3つの英文のうち、「これくらいの文章なら自分で書けそう」と思うものを選んでください。\n' +
+    '次の3つの英文のうち、「自分ならこう書きそうだな」と感じるものを選んでください。\n' +
     '番号が大きくなるほど、単語や文法のレベルが少しずつ上がっていきます。\n\n' +
     '1) I like watching movies and playing games in my free time.\n' +
-    '2) I\'d really appreciate it if you could share the updated schedule when you have a moment.\n' +
+    "2) I'd really appreciate it if you could share the updated schedule when you have a moment.\n" +
     '3) We need to prioritize this task, otherwise it may negatively affect the project timeline.\n\n' +
     '「テスト結果: 2」のように、番号つきで送ってください。';
 
@@ -1151,7 +1150,8 @@ async function handleAcceptCurrentEnglish(replyToken, user) {
     text:
       (lessonText
         ? '✨ ネイティブならこう言いそう\n------------------------------\n' + lessonText
-        : 'ネイティブっぽい別案の生成に失敗しましたが、英文自体はそのまま使って大丈夫です。'),
+        : 'ネイティブっぽい別案の生成に失敗しましたが、英文自体はそのまま使って大丈夫です。') +
+      '',
     quickReply: { items: baseQuickReplyItems() },
   };
 
@@ -1191,14 +1191,10 @@ async function handleEnToJa(text, replyToken, user, options = {}) {
 
   let resultText = ja;
 
-  // ★ 英語じゃない term（日本語など）は捨てる
-  const filteredGlossary = (glossary || []).filter(
-    (g) => g.term && /[A-Za-z]/.test(g.term)
-  );
-
-  if (filteredGlossary.length > 0) {
+  if (glossary && glossary.length > 0) {
     resultText += '\n\n📚 チェックしておきたい単語・表現\n';
-    filteredGlossary.forEach((g) => {
+    glossary.forEach((g) => {
+      if (!g.term) return;
       const meaning = g.meaning_ja || '';
       const note = g.note_ja || '';
       if (meaning && note) {

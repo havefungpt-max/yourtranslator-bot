@@ -59,7 +59,7 @@ async function getOrCreateUser(lineUserId) {
     line_user_id: lineUserId,
     level_type: 'eiken',           // 'eiken' | 'toeic' | 'rough'
     level_value: '2',              // '5','4','3','pre2','2','pre1','1' など
-    english_style: 'japanese',     // 'japanese' | 'american' | 'british' | (互換) 'neutral'
+    english_style: 'japanese',     // UIでは日本人英語固定
     usage_default: 'CHAT_FRIEND',  // 'CHAT_FRIEND' | 'MAIL_INTERNAL' | 'MAIL_EXTERNAL'
     tone_default: 'polite',        // 'casual' | 'polite' | 'business'
     created_at: now,
@@ -111,21 +111,32 @@ function detectLanguage(text) {
 
 // ---------- ヘルパー：Quick Reply ----------
 
-function baseQuickReplyItems() {
-  return [
-    {
-      type: 'action',
-      action: { type: 'message', label: '🏠 ホーム', text: 'ホーム' },
-    },
-    {
-      type: 'action',
-      action: { type: 'message', label: '❓ 使い方', text: '使い方' },
-    },
-  ];
+function settingsQuickReplyItem() {
+  return {
+    type: 'action',
+    action: { type: 'message', label: '⚙ 設定', text: 'ホーム' },
+  };
 }
 
+// includeHelp = true のときだけ「使い方」も出す
+function baseQuickReplyItems(includeHelp = true) {
+  const items = [settingsQuickReplyItem()];
+  if (includeHelp) {
+    items.push({
+      type: 'action',
+      action: { type: 'message', label: '❓ 使い方', text: '使い方' },
+    });
+  }
+  return items;
+}
+
+// 英文生成時のクイックメニュー
 function toneQuickReplyItems() {
   return [
+    {
+      type: 'action',
+      action: { type: 'message', label: '✨ この英文でOK', text: 'この英文でOK' },
+    },
     {
       type: 'action',
       action: { type: 'message', label: '😊 カジュアルに', text: 'トーン:カジュアル' },
@@ -138,14 +149,11 @@ function toneQuickReplyItems() {
       type: 'action',
       action: { type: 'message', label: '💼 ビジネスに', text: 'トーン:ビジネス' },
     },
-    {
-      type: 'action',
-      action: { type: 'message', label: '✨ この英文でOK', text: 'この英文でOK' },
-    },
-    ...baseQuickReplyItems(),
+    settingsQuickReplyItem(),
   ];
 }
 
+// ホーム画面用の設定ボタン列
 function homeQuickReplyItems() {
   return [
     {
@@ -159,10 +167,6 @@ function homeQuickReplyItems() {
     {
       type: 'action',
       action: { type: 'message', label: '🎨 文体', text: '[設定] 文体' },
-    },
-    {
-      type: 'action',
-      action: { type: 'message', label: '🌍 英語タイプ', text: '[設定] 英語タイプ' },
     },
     {
       type: 'action',
@@ -198,7 +202,7 @@ function toneLabel(tone_default) {
 }
 
 function englishStyleLabel(style) {
-  // 互換：古い 'neutral' も日本人英語扱い
+  // UI的には日本人英語固定だが、既存データに american / british があれば尊重
   if (style === 'american') return 'アメリカ英語';
   if (style === 'british') return 'イギリス英語';
   return '日本人英語';
@@ -248,20 +252,13 @@ function buildHomeText(user) {
   return (
     '🏠 YourTranslator ホーム\n\n' +
     'YourTranslator は、キレイすぎる翻訳ツールや AI の英語ではなく、\n' +
-    'あなたの英語レベルと場面に合わせて\n' +
-    '「自分ならこう書くな」と感じる英文を一緒に作るボットです。\n' +
-    '英文を貼ってもらえれば、英語⇄日本語の翻訳もお手伝いします。\n\n' +
+    'あなたが普段使いそうな自然な英文と、ワンランク上の英文を提案する相棒です。\n' +
+    '翻訳したい日本語か英語の文を、そのまま送ってください。\n\n' +
     'いまの設定はこんな感じです：\n' +
     `・レベル：${levelLabel(user)}\n` +
     `・よく使う場面：${usageSceneLabel(user.usage_default)}\n` +
     `・英語の雰囲気：${englishStyleLabel(user.english_style)}\n` +
-    `・デフォルト文体：${toneLabel(user.tone_default)}\n\n` +
-    '🔍 ざっくりいうと…\n' +
-    '・レベル → どのくらいむずかしい英語まで使うか\n' +
-    '・場面 → チャット用か、社内メールか、社外メールか\n' +
-    '・英語の雰囲気 → 日本人英語 / アメリカ英語 / イギリス英語\n' +
-    '・文体 → カジュアル / 丁寧 / ビジネス\n\n' +
-    '変えたいところがあれば、下のボタンから調整できます。'
+    `・デフォルト文体：${toneLabel(user.tone_default)}\n`
   );
 }
 
@@ -283,6 +280,7 @@ async function generateEnglishFromJapanese({ user, sourceText, toneOverride }) {
 
   const tone = toneOverride || user.tone_default; // 'casual' | 'polite' | 'business'
 
+  // スタイルは基本「日本人英語」想定
   let englishStyleText;
   switch (user.english_style) {
     case 'american':
@@ -294,7 +292,7 @@ async function generateEnglishFromJapanese({ user, sourceText, toneOverride }) {
         'British English: use natural UK-style expressions and spelling where relevant (e.g., organise, colour).';
       break;
     case 'japanese':
-    case 'neutral': // backward compatibility
+    case 'neutral':
     default:
       englishStyleText =
         'Japanese learner English: globally understandable, safe, slightly modest tone, avoid heavy slang.';
@@ -367,14 +365,16 @@ async function explainEnglishToJapaneseWithGlossary({ user, sourceText }) {
 You are an English-to-Japanese translator and tutor for Japanese learners.
 
 Concept:
-- Focus on words and grammar that are likely to be unfamiliar or slightly above the user's level.
+- Focus on words and expressions that are likely to be unfamiliar or slightly above the user's level.
 - Do NOT waste space on very basic words (e.g., good, go, big, today).
 
 Tasks:
 1. Translate the English text into natural Japanese.
 2. Pick 0–5 words or expressions that might be difficult for the user (based on the given level).
-3. Explain each in a compact way.
-4. Optionally, if there is a "movie-style" or idiomatic expression, you can add a note about how it is often paraphrased in Japanese subtitles.
+3. For each, provide:
+   - the English term
+   - a short Japanese meaning
+   - an optional short note in Japanese (1 sentence), e.g. nuance or a "movie-style" paraphrase.
 
 User level will be given (e.g., EIKEN or TOEIC band), so keep explanations simple.
 
@@ -388,15 +388,13 @@ Return ONLY a JSON object with this shape:
       "meaning_ja": "日本語の意味（1フレーズ）",
       "note_ja": "やさしい日本語での補足（1文以内。映画のセリフ風の意訳コメントがあってもよい）"
     }
-  ],
-  "grammar": "この文で押さえておくと良い文法ポイントを日本語で1〜2文（特になければ空文字や null でもよい）"
+  ]
 }
 
 Rules:
 - Pick vocabulary or expressions that are slightly above or around the user's level.
 - Avoid very basic, textbook-level vocabulary.
 - Each "note_ja" should be short (ideally one short sentence).
-- "grammar" should be short and practical (e.g., tense, modal verbs, conditional if, etc.).
 - No extra text. No comments. No Markdown. No backticks.
 `.trim();
 
@@ -431,14 +429,12 @@ ${sourceText}
     return {
       ja: raw,
       glossary: [],
-      grammar: '',
     };
   }
 
   return {
     ja: parsed.ja || '',
     glossary: Array.isArray(parsed.glossary) ? parsed.glossary : [],
-    grammar: typeof parsed.grammar === 'string' ? parsed.grammar : '',
   };
 }
 
@@ -459,10 +455,8 @@ Output format (in Japanese, except for the English example):
 <one native-like English example>
 
 🔎 ポイント:
-・どこがどう違うか（丁寧さ・フォーマルさ・ニュアンスなど）を2〜3行で説明
-・「〜な表現になりました」「あなたの文をこう直しました」など、
-  ユーザーの英文を評価・添削する言い方は避ける
-・代わりに「こういう言い方もよく使われます」「この表現は〜という雰囲気です」のように、
+・どんな場面・ニュアンスでよく使われるかを2〜3行で説明
+・「こういう言い方もよく使われます」「この表現は〜という雰囲気です」のように、
   追加の選択肢として紹介する
 ・余裕があれば、1つの単語や表現について軽く由来やイメージ（root やニュアンス）を1行だけ触れてもよい
 
@@ -560,13 +554,6 @@ async function handleEvent(event) {
     return handleSetTone(event.replyToken, user, text);
   }
 
-  if (text === '[設定] 英語タイプ') {
-    return replyEnglishStyle(event.replyToken);
-  }
-  if (text.startsWith('SET_EN_STYLE_')) {
-    return handleSetEnglishStyle(event.replyToken, user, text);
-  }
-
   // トーン変更
   if (text.startsWith('トーン:')) {
     const toneLabelJa = text.replace('トーン:', '');
@@ -592,7 +579,7 @@ async function handleEvent(event) {
     return lineClient.replyMessage(event.replyToken, {
       type: 'text',
       text: '今は日本語と英語だけをサポートしています。\n日本語か英語で送ってみてください。',
-      quickReply: { items: baseQuickReplyItems() },
+      quickReply: { items: baseQuickReplyItems(false) },
     });
   }
 }
@@ -609,16 +596,19 @@ async function replyHelp(replyToken) {
       '『自分ならこう書くな』と感じる英文を一緒に作るボットです。\n\n' +
       '📝 できること\n' +
       '・日本語で送る → 英文を作成\n' +
-      '・英語で送る → 和訳＋むずかしめ単語＆文法のミニ解説\n' +
+      '・英語で送る → 和訳＋ちょっとむずかしめの英単語・表現のミニ解説\n' +
       '・日本語＋英語まじり → 英訳 / 和訳を選択\n\n' +
-      '⚙️ おすすめの使い方\n' +
-      '1) 「ホーム」で自分のレベル・用途・文体をざっくり決める\n' +
-      '2) あとは日本語 or 英語の文をそのまま送る\n' +
-      '3) 英文が出たら、クイックメニューで\n' +
-      '   ・カジュアル / 丁寧 / ビジネス に言い換え\n' +
-      '   ・「この英文でOK」で、ネイティブっぽい別案＋解説を見る\n\n' +
-      '困ったらまた「ヘルプ」と送ってください。',
-    quickReply: { items: baseQuickReplyItems() },
+      '⚙️ 設定のイメージ\n' +
+      '・レベル → 単語・文法のむずかしさ\n' +
+      '・用途 → チャット / 社内メール / 社外メール\n' +
+      '・文体 → カジュアル / 丁寧 / ビジネス\n' +
+      '同じ日本語でも、用途や文体を変えると「語尾・前置き・ていねいさ」が変わります。\n\n' +
+      '✨ 「この英文でOK」を押すと\n' +
+      '・今の英文はそのままOK、という前提で\n' +
+      '・ネイティブならこう言いそう、という別案＋日本語でのポイント解説が返ってきます。\n' +
+      '  （あなたの英文をダメ出しするのではなく、「こういう言い方もあるよ」を足すイメージです）\n\n' +
+      'まずは、翻訳したい日本語か英語の文をそのまま送ってみてください。',
+    quickReply: { items: baseQuickReplyItems(true) },
   };
   return lineClient.replyMessage(replyToken, message);
 }
@@ -637,25 +627,26 @@ async function replyUsage(replyToken) {
   const text =
     '📖 使い方ガイド\n\n' +
     '1️⃣ まずは設定\n' +
-    '・「ホーム」→ レベル / 用途 / 文体 / 英語タイプ をざっくり決める\n' +
+    '・「ホーム」→ レベル / 用途 / 文体 をざっくり決める\n' +
     '・「🎯 レベル」から、英検 / TOEIC / かんたんテスト で自分のレベルを選ぶ\n\n' +
     '2️⃣ 日本語で送ると…\n' +
     '・そのままの意味で使える英文にして返します\n' +
-    '・レベル・用途・文体・英語タイプに合わせて、言い回しを調整します\n\n' +
+    '・レベル・用途・文体に合わせて、言い回しや丁寧さを調整します\n\n' +
     '3️⃣ 英語で送ると…\n' +
     '・自然な日本語訳\n' +
-    '・あなたのレベルから見て「ちょっとむずかしい」単語・表現の意味\n' +
-    '・1〜2行の文法ポイント\n\n' +
-    '4️⃣ さらに調整したいとき\n' +
+    '・あなたのレベルから見て「ちょっとむずかしい」英単語・表現のミニ解説\n\n' +
+    '4️⃣ 日本語＋英語がまざるとき\n' +
+    '・「英訳してほしい」「和訳してほしい」のボタンが出るので、どちらかを選びます\n\n' +
+    '5️⃣ さらに調整したいとき\n' +
     '・「カジュアルに / 丁寧に / ビジネスに」を押すと文体だけ変えた英文に\n' +
     '・「この英文でOK」を押すと、\n' +
-    '   → ネイティブならこう言いそう、という別案＋解説が返ってきます\n\n' +
+    '   → ネイティブならこう言いそう、という別案＋日本語のポイント解説が返ってきます\n\n' +
     'むずかしく考えなくて大丈夫なので、まずはいつもの文をそのまま投げてみてください。';
 
   const message = {
     type: 'text',
     text,
-    quickReply: { items: baseQuickReplyItems() },
+    quickReply: { items: baseQuickReplyItems(true) },
   };
 
   return lineClient.replyMessage(replyToken, message);
@@ -690,7 +681,7 @@ async function replyLevelTestIntro(replyToken) {
           type: 'action',
           action: { type: 'message', label: '③', text: 'テスト結果: 3' },
         },
-        ...baseQuickReplyItems(),
+        ...baseQuickReplyItems(true),
       ],
     },
   };
@@ -719,7 +710,7 @@ async function handleTestResult(replyToken, user, text) {
         text:
           '1〜3のどれかで答えてください。\n' +
           '例：「テスト結果: 2」',
-        quickReply: { items: baseQuickReplyItems() },
+        quickReply: { items: baseQuickReplyItems(true) },
       });
   }
 
@@ -1027,70 +1018,6 @@ async function handleSetTone(replyToken, user, text) {
   return lineClient.replyMessage(replyToken, message);
 }
 
-// -- 英語タイプ設定 --
-
-async function replyEnglishStyle(replyToken) {
-  const message = {
-    type: 'text',
-    text:
-      '🌍 英語の雰囲気を選んでください。\n\n' +
-      '・日本人英語：まずはこれでOK（ていねいで無難な英語）\n' +
-      '・アメリカ英語：US の同僚やお客さんが多いとき\n' +
-      '・イギリス英語：UK 寄りの表現・綴りが好きなとき',
-    quickReply: {
-      items: [
-        {
-          type: 'action',
-          action: {
-            type: 'message',
-            label: '日本人英語',
-            text: 'SET_EN_STYLE_JAPANESE',
-          },
-        },
-        {
-          type: 'action',
-          action: {
-            type: 'message',
-            label: 'アメリカ英語',
-            text: 'SET_EN_STYLE_AMERICAN',
-          },
-        },
-        {
-          type: 'action',
-          action: {
-            type: 'message',
-            label: 'イギリス英語',
-            text: 'SET_EN_STYLE_BRITISH',
-          },
-        },
-      ],
-    },
-  };
-  return lineClient.replyMessage(replyToken, message);
-}
-
-async function handleSetEnglishStyle(replyToken, user, text) {
-  let style = 'japanese';
-  if (text === 'SET_EN_STYLE_AMERICAN') style = 'american';
-  if (text === 'SET_EN_STYLE_BRITISH') style = 'british';
-  if (text === 'SET_EN_STYLE_JAPANESE') style = 'japanese';
-
-  const updated = await updateUser(user.line_user_id, {
-    english_style: style,
-  });
-
-  const textReply =
-    `🌍 英語の雰囲気を「${englishStyleLabel(updated.english_style)}」にしました。\n\n` +
-    buildHomeText(updated);
-
-  const message = {
-    type: 'text',
-    text: textReply,
-    quickReply: { items: homeQuickReplyItems() },
-  };
-  return lineClient.replyMessage(replyToken, message);
-}
-
 // -- トーン変更 --
 
 async function handleToneChange(replyToken, user, toneLabelJa) {
@@ -1098,7 +1025,7 @@ async function handleToneChange(replyToken, user, toneLabelJa) {
     return lineClient.replyMessage(replyToken, {
       type: 'text',
       text: 'まず日本語の文を送って英文を作ってから、文体を変えてみてください。',
-      quickReply: { items: baseQuickReplyItems() },
+      quickReply: { items: baseQuickReplyItems(false) },
     });
   }
 
@@ -1134,7 +1061,7 @@ async function handleAcceptCurrentEnglish(replyToken, user) {
     return lineClient.replyMessage(replyToken, {
       type: 'text',
       text: 'まず日本語の文を送って、英文を作ってから選んでください。',
-      quickReply: { items: baseQuickReplyItems() },
+      quickReply: { items: baseQuickReplyItems(false) },
     });
   }
 
@@ -1150,9 +1077,8 @@ async function handleAcceptCurrentEnglish(replyToken, user) {
     text:
       (lessonText
         ? '✨ ネイティブならこう言いそう\n------------------------------\n' + lessonText
-        : 'ネイティブっぽい別案の生成に失敗しましたが、英文自体はそのまま使って大丈夫です。') +
-      '',
-    quickReply: { items: baseQuickReplyItems() },
+        : 'ネイティブっぽい別案の生成に失敗しましたが、英文自体はそのまま使って大丈夫です。'),
+    quickReply: { items: baseQuickReplyItems(false) },
   };
 
   return lineClient.replyMessage(replyToken, message);
@@ -1181,10 +1107,10 @@ async function handleJaToEn(text, replyToken, user, options = {}) {
   return lineClient.replyMessage(replyToken, message);
 }
 
-// -- 英語 → 日本語（和訳＋語彙・文法解説） --
+// -- 英語 → 日本語（和訳＋語彙解説） --
 
 async function handleEnToJa(text, replyToken, user, options = {}) {
-  const { ja, glossary, grammar } = await explainEnglishToJapaneseWithGlossary({
+  const { ja, glossary } = await explainEnglishToJapaneseWithGlossary({
     user,
     sourceText: text,
   });
@@ -1207,10 +1133,6 @@ async function handleEnToJa(text, replyToken, user, options = {}) {
     });
   }
 
-  if (grammar && grammar.trim().length > 0) {
-    resultText += '\n\n◆文法のポイント\n' + grammar.trim();
-  }
-
   await updateUser(user.line_user_id, {
     last_source_en: text,
     last_output_ja: ja,
@@ -1220,7 +1142,7 @@ async function handleEnToJa(text, replyToken, user, options = {}) {
   const message = {
     type: 'text',
     text: resultText,
-    quickReply: { items: baseQuickReplyItems() },
+    quickReply: { items: baseQuickReplyItems(false) },
   };
 
   return lineClient.replyMessage(replyToken, message);
@@ -1252,7 +1174,7 @@ async function handleMixed(text, replyToken) {
             text: `TRANSLATE_TO_JA:::${text}`,
           },
         },
-        ...baseQuickReplyItems(),
+        ...baseQuickReplyItems(true),
       ],
     },
   };

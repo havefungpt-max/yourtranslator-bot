@@ -675,9 +675,7 @@ async function replyUsage(replyToken) {
 
 async function replyLevelTestIntro(replyToken) {
   const text =
-    '📘 かんたんレベルチェッ
-
-ク\n\n' +
+    '📘 かんたんレベルチェック\n\n' +
     '次の3つの英文のうち、「自分ならこう書きそうだな」と感じるものを選んでください。\n' +
     '番号が大きくなるほど、単語や文法のレベルが少しずつ上がっていきます。\n\n' +
     '1) I like watching movies and playing games in my free time.\n' +
